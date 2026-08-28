@@ -85,6 +85,7 @@ public:
         m_final_purge(final_purge),
         m_layer_idx(-1),
         m_tool_change_idx(0),
+        m_sparse_layers_skipped(wipe_tower_sparse_layers_skipped(print_config)),
         m_plate_origin(plate_origin),
         m_single_extruder_multi_material(print_config.single_extruder_multi_material),
         m_enable_timelapse_print(print_config.timelapse_type.value == TimelapseType::tlSmooth),
@@ -92,6 +93,8 @@ public:
         m_is_first_print(true),
         m_print_config(&print_config)
     {
+        if (m_sparse_layers_skipped)
+            m_compacted_tower_z = compute_compacted_wipe_tower_z(tool_changes);
         // initialize with the extruder offset of master extruder id
         m_extruder_offsets.resize(print_config.filament_map.size(), print_config.extruder_offset.get_at(print_config.master_extruder_id.value - 1));
         const auto& filament_map = print_config.filament_map.values; // 1 based idx
@@ -136,7 +139,13 @@ private:
     // Current layer index.
     int                                                          m_layer_idx;
     int                                                          m_tool_change_idx;
-    double                                                       m_last_wipe_tower_print_z = 0.f;
+    // Whether the tower this integration emits is actually compacted, see wipe_tower_sparse_layers_skipped().
+    // Every compaction branch below is gated on this rather than on wipe_tower_no_sparse_layers, so that
+    // emission stays on the plain path whenever the tower was planned onto every layer anyway.
+    const bool                                                   m_sparse_layers_skipped;
+    // Print z of the compacted tower per planned layer, only filled when the tower is compacted.
+    // Shared with the clearance validator through compute_compacted_wipe_tower_z().
+    std::vector<float>                                           m_compacted_tower_z;
 
     // BBS
     Vec3d                                                        m_plate_origin;
@@ -286,6 +295,10 @@ private:
 
         bool is_open() const { return f; }
         bool is_error() const;
+        // Human-readable description of the first write/flush failure (errno-based),
+        // or an empty string if no OS-level error was recorded. Lets the caller report
+        // the real cause (e.g. "No space left on device") instead of guessing.
+        std::string get_last_error() const;
 
         void flush();
         void close();
@@ -305,10 +318,15 @@ private:
     private:
         FILE *f = nullptr;
         GCodeProcessor &m_processor;
+        // errno captured at the first failed fwrite/fflush, 0 if none.
+        int  m_write_errno = 0;
     };
     void            _do_export(Print &print, GCodeOutputStream &file, ThumbnailsGeneratorCallback thumbnail_cb);
 
-    static std::vector<LayerToPrint>        		                   collect_layers_to_print(const PrintObject &object);
+    // When out_empty_layer_warning is provided, the empty-layer warning text is written there instead
+    // of being pushed to the Print step immediately, so the caller can aggregate warnings from all
+    // objects into a single notification.
+    static std::vector<LayerToPrint>        		                   collect_layers_to_print(const PrintObject &object, std::string *out_empty_layer_warning = nullptr);
     static std::vector<std::pair<coordf_t, std::vector<LayerToPrint>>> collect_layers_to_print(const Print &print);
 
     struct LayerResult {

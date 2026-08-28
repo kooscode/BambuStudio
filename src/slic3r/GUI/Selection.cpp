@@ -119,11 +119,13 @@ bool Selection::Clipboard::is_sla_compliant() const
 Selection::Clipboard::Clipboard()
 {
     m_model.reset(new Model);
+    m_copy_volume_step = 0;
 }
 
 void Selection::Clipboard::reset()
 {
     m_model->clear_objects();
+    m_copy_volume_step = 0;
 }
 
 bool Selection::Clipboard::is_empty() const
@@ -190,15 +192,54 @@ void Selection::set_mode(EMode mode) {
     m_mode = mode;
 }
 
-int Selection::query_real_volume_idx_from_other_view(unsigned int object_idx, unsigned int instance_idx, unsigned int model_volume_idx)
+int Selection::query_real_volume_idx_by_part_guid(const std::string& part_guid, unsigned int instance_idx)
 {
-    for (int i = 0; i < m_volumes->size(); i++) {
-        auto v = (*m_volumes)[i];
-        if (v->object_idx() == object_idx && instance_idx == v->instance_idx() && model_volume_idx == v->volume_idx()) {
+    if (part_guid.empty() || m_model == nullptr)
+        return -1;
+    // First try to honor the requested instance; fall back to the first matching volume of any instance.
+    int fallback = -1;
+    for (int i = 0; i < (int) m_volumes->size(); i++) {
+        const GLVolume* v = (*m_volumes)[i];
+        const int obj_idx = v->object_idx();
+        const int vol_idx = v->volume_idx();
+        if (obj_idx < 0 || vol_idx < 0 || obj_idx >= (int) m_model->objects.size())
+            continue;
+        const ModelObject* mo = m_model->objects[obj_idx];
+        if (mo == nullptr || vol_idx >= (int) mo->volumes.size())
+            continue;
+        const ModelVolume* mv = mo->volumes[vol_idx];
+        if (mv == nullptr)
+            continue;
+        // A GLVolume in the assembly view matches when its backing ModelVolume shares identity with the
+        // prepare-side part: same part_guid, or it references that prepare part via assembly_src_guid.
+        if (mv->part_guid() != part_guid && mv->assembly_src_guid() != part_guid)
+            continue;
+        if ((unsigned int) v->instance_idx() == instance_idx)
             return i;
-        }
+        if (fallback < 0)
+            fallback = i;
     }
-    return -1;
+    return fallback;
+}
+
+int Selection::query_real_volume_idx_from_other_model_volume(const GLVolume* source_volume, const Model& source_model, bool use_assembly_src_guid)
+{
+    if (source_volume == nullptr)
+        return -1;
+    const int obj_idx = source_volume->object_idx();
+    const int vol_idx = source_volume->volume_idx();
+    if (obj_idx < 0 || vol_idx < 0 || obj_idx >= (int) source_model.objects.size())
+        return -1;
+    const ModelObject* mo = source_model.objects[obj_idx];
+    if (mo == nullptr || vol_idx >= (int) mo->volumes.size())
+        return -1;
+    const ModelVolume* mv = mo->volumes[vol_idx];
+    if (mv == nullptr)
+        return -1;
+    const std::string& guid = use_assembly_src_guid && !mv->assembly_src_guid().empty() ? mv->assembly_src_guid() : mv->part_guid();
+    if (guid.empty())
+        return -1;
+    return query_real_volume_idx_by_part_guid(guid, (unsigned int) source_volume->instance_idx());
 }
 
 void Selection::add(unsigned int volume_idx, bool as_single_selection, bool check_for_already_contained)
@@ -568,6 +609,7 @@ void Selection::clone(int numbers)
     wxGetApp().plater()->take_snapshot(std::string("Selection-clone"));
     copy_to_clipboard();
     for (int i = 0; i < numbers; i++) {
+        m_clipboard.copy_volume_step_up();
         paste_from_clipboard();
     }
 }
@@ -2313,6 +2355,9 @@ void Selection::copy_to_clipboard()
                     ModelVolume* src_volume = src_object->volumes[volume_idx];
                     ModelVolume* dst_volume = dst_object->add_volume(*src_volume);
                     dst_volume->set_new_unique_id();
+                    // New identity for prepare<->assembly sync; shared part_guid would make
+                    // sync_assemble_model_on_enter treat the paste as already mapped.
+                    dst_volume->ensure_part_guid(true);
                 } else {
                     assert(false);
                 }
@@ -3367,6 +3412,16 @@ void Selection::paste_volumes_from_clipboard()
         Transform3d src_matrix = src_object->instances[0]->get_transformation().get_matrix_no_offset();
         Transform3d dst_matrix = dst_instance->get_transformation().get_matrix_no_offset();
         bool from_same_object = (src_object->input_file == dst_object->input_file) && src_matrix.isApprox(dst_matrix);
+        BoundingBoxf3 sel_bb;
+        if (from_same_object) {
+            for (unsigned int i : m_list) {
+                const GLVolume &gl_vol = *(*m_volumes)[i];
+                if (gl_vol.object_idx() == dst_obj_idx && gl_vol.instance_idx() == dst_inst_idx) {
+                    BoundingBoxf3 vol_bb = gl_vol.transformed_convex_hull_bounding_box();
+                    sel_bb.merge(vol_bb);
+                }
+            }
+        }
         const Transform3d vol_linear_correction = dst_matrix.inverse() * src_matrix;
 
         // used to keep relative position of multivolume selections when pasting from another object
@@ -3377,11 +3432,19 @@ void Selection::paste_volumes_from_clipboard()
         {
             ModelVolume* dst_volume = dst_object->add_volume(*src_volume);
             dst_volume->set_new_unique_id();
+            dst_volume->ensure_part_guid(true);
             if (from_same_object)
             {
-//                // if the volume comes from the same object, apply the offset in world system
-//                double offset = wxGetApp().plater()->canvas3D()->get_size_proportional_to_max_bed_size(0.05);
-//                dst_volume->translate(dst_matrix.inverse() * Vec3d(offset, offset, 0.0));
+                int step = m_clipboard.copy_volume_step();
+                if (step > 0) {
+                    double offset = sel_bb.size().x() * step;
+                    const Vec3d displacement = dst_matrix.inverse() * Vec3d(offset, -0.5 * offset, 0.0);
+                    dst_volume->translate(displacement);
+                    // translate() only updates m_transformation; keep per-volume assemble pose in sync
+                    // so the paste offset also shows in assembly view (add_volume copies assemble_*).
+                    if (dst_volume->is_assemble_initialized())
+                        dst_volume->set_assemble_offset(dst_volume->get_assemble_transformation().get_offset() + displacement);
+                }
             }
             else
             {
@@ -3447,6 +3510,11 @@ void Selection::paste_objects_from_clipboard()
     {
         const ModelObject *src_object = src_objects[i];
         ModelObject* dst_object = m_model->add_object(*src_object);
+        // add_object copies part_guid; force new GUIDs so assembly sync does not collapse
+        // the paste into the source object (STEP multi-volume copies hit this hard).
+        for (ModelVolume *mv : dst_object->volumes)
+            if (mv->is_model_part())
+                mv->ensure_part_guid(true);
         normalize_pasted_object_filament_config(*dst_object, filaments_count);
 
         // BBS: find an empty cell to put the copied object

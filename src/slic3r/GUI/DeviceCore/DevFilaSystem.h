@@ -34,6 +34,15 @@ enum DevFilaColorType : int
 class DevAmsTray
 {
 public:
+    enum class RemainFetchStatus : int
+    {
+        Done         = 0,
+        Refreshing   = 1,
+        CloudTimeout = 2,
+        CloudNoData  = 3,
+        Initializing = 4,
+    };
+
     DevAmsTray(std::string tray_id)
     {
         is_bbl = false;
@@ -63,7 +72,8 @@ public:
     DevFilaColorType         ctype = DevFilaColorType::CTYPE_SINGLE;
     float                    k        = 0.0f; // k range: 0 ~ 0.5
     float                    n        = 0.0f; // k range: 0.6 ~ 2.0
-    int                      cali_idx = -1;   // - 1 means default
+    int                      cali_idx             = -1;  // - 1 means default
+    RemainFetchStatus        remain_fetch_status  = RemainFetchStatus::Done; // bits[5-7] of MQTT "state" field
 
     wxColour        wx_color;
     bool            is_bbl;
@@ -148,6 +158,12 @@ public:
         On = 1,
     };
 
+    enum class RemainEstimateVersion : int
+    {
+        Legacy   = 0,   // Legacy: coarse estimate.
+        Accurate = 1,   // Accurate: O1D U4 precise estimate.
+    };
+
     enum class CannotDryReason : int
     {
         TaskOccupied = 0,
@@ -228,6 +244,8 @@ public:
 
     bool AmsIsDrying();
 
+    RemainEstimateVersion GetRemainEstimateVersion() const { return m_remain_estimate_version; }
+
 private:
     std::weak_ptr<DevFilaSystem> m_fila_system;
 
@@ -260,6 +278,7 @@ private:
     std::optional<DryFanStatus> m_dry_fan2_status;
     std::optional<std::vector<CannotDryReason>> m_dry_cannot_reasons;
     std::optional<DrySettings> m_dry_settings;
+    RemainEstimateVersion m_remain_estimate_version = RemainEstimateVersion::Legacy;
 };
 
 class DevFilaSystem

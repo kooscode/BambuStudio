@@ -23,6 +23,7 @@ import {
 // matches an unedited single-slot save byte for byte.
 import {
   buildSpoolFromTray,
+  getTrayCurrentNetWeight,
   partitionTraysForBatchCreate,
 } from './buildSpoolFromTray';
 // STUDIO-18385: gate AMS save on duplicate RFID detection so users explicitly
@@ -64,19 +65,6 @@ const normalizeColorCode = canonicalizeHex;
 
 function isPresetColor(value: string): boolean {
   return BAMBU_COLORS.some((c) => c.toUpperCase() === value.toUpperCase());
-}
-
-// Derive the AMS tray's *current* net weight in grams from the MQTT payload.
-// `tray.weight` is the spool's initial net (e.g. "1000"), and `tray.remain`
-// is the AMS-reported remaining percentage. Falls back to the initial net
-// when remain% is missing so brand-new or non-RFID spools still show a
-// sensible value instead of "—".
-function getTrayCurrentNetWeight(tray: AmsTray): number {
-  const init = parseInt(String(tray.weight ?? '0'), 10) || 0;
-  const remain = typeof tray.remain === 'number' ? tray.remain : 0;
-  if (init <= 0) return 0;
-  if (remain <= 0) return init;
-  return Math.round(init * remain / 100);
 }
 
 function hasCloudRfid(tagUid: string): boolean {
@@ -155,7 +143,7 @@ interface Props {
     creates: Partial<Spool>[],
     updates: Partial<Spool>[],
   ) => boolean | Promise<boolean>;
-  onFetchMachines: () => Promise<MachineItem[]>;
+  onFetchMachines: () => Promise<{ machines: MachineItem[]; selectedDevId: string }>;
   // Ask the currently-selected (or specified) printer to resend its full
   // state package. Bound to the refresh button next to the Printer
   // dropdown. Read-only with respect to the globally selected machine.
@@ -281,6 +269,7 @@ export function AddEditDialog({
   });
   const [amsLoading, setAmsLoading] = useState(false);
   const [amsError, setAmsError] = useState('');
+  const emptyAmsPollCountRef = useRef(0);
   // STUDIO-18344: shown above the slot grid in multi-select mode so the user
   // can see how many tag_uid hits will overwrite existing spools before
   // confirming the batch save. Derived in a useMemo below.
@@ -448,26 +437,24 @@ export function AddEditDialog({
       });
     }
 
-    if (set.size === 0) {
-      const vendors = brand ? presets.filter((v) => v.name === brand) : presets;
-      vendors.forEach((v) => {
-        v.types.forEach((tp) => {
-          if (Array.isArray(tp.items) && tp.items.length > 0) {
-            tp.items.forEach((item) => {
-              const name = normalizePresetFilamentName(item.name, v.name, tp.name, item.series || '');
-              if (name) set.add(name);
-            });
-            return;
-          }
-          const series = Array.isArray(tp.series) ? tp.series.filter(Boolean) : [];
-          if (series.length === 0) {
-            if (tp.name) set.add(tp.name);
-          } else {
-            series.forEach((s) => set.add(formatTypeSeries(tp.name, s)));
-          }
-        });
+    const vendors = brand ? presets.filter((v) => v.name === brand) : presets;
+    vendors.forEach((v) => {
+      v.types.forEach((tp) => {
+        if (Array.isArray(tp.items) && tp.items.length > 0) {
+          tp.items.forEach((item) => {
+            const name = normalizePresetFilamentName(item.name, v.name, tp.name, item.series || '');
+            if (name) set.add(name);
+          });
+          return;
+        }
+        const series = Array.isArray(tp.series) ? tp.series.filter(Boolean) : [];
+        if (series.length === 0) {
+          if (tp.name) set.add(tp.name);
+        } else {
+          series.forEach((s) => set.add(formatTypeSeries(tp.name, s)));
+        }
       });
-    }
+    });
     return [...set].sort();
   }, [brand, cloudConfig, presets, getCloudSettingDisplayName]);
 
@@ -1310,7 +1297,7 @@ export function AddEditDialog({
     setAmsLoading(true);
     setAmsError('');
     try {
-      const list = await onFetchMachines();
+      const { machines: list, selectedDevId: fetchedSelectedDev } = await onFetchMachines();
       setMachines(list);
       if (list.length === 0) {
         setAmsData(null);
@@ -1325,8 +1312,12 @@ export function AddEditDialog({
       // (DeviceManager::get_selected_machine), falling back to the first
       // online / first machine only when the global selection is not in
       // this printer list.
+      // Use fetchedSelectedDev (from the RPC response) rather than globalSelectedDev
+      // (Zustand store snapshot): React state updates are async-batched, so the
+      // store mirror set inside fetchMachines may not yet be flushed in this tick.
+      const resolvedDev = fetchedSelectedDev || globalSelectedDev;
       const defaultDev =
-        list.find((m) => globalSelectedDev && m.dev_id === globalSelectedDev) ||
+        list.find((m) => resolvedDev && m.dev_id === resolvedDev) ||
         list.find((m) => m.is_online) ||
         list[0];
       // If the default machine already matches Studio's globally selected
@@ -1334,13 +1325,14 @@ export function AddEditDialog({
       // Only when we fall back to "first online / first in the list" do
       // we ask C++ to switch once so the tray list is not empty. This is
       // a one-shot soft switch at dialog open, not a recurring trigger.
-      const needSwitch = !globalSelectedDev || defaultDev.dev_id !== globalSelectedDev;
+      const needSwitch = !resolvedDev || defaultDev.dev_id !== resolvedDev;
       const data = await onFetchAmsData(defaultDev.dev_id, needSwitch);
       setAmsData(data);
       if (data && data.ams_units.length > 0) {
         setSelectedUnit(data.ams_units[0].ams_id);
       } else {
-        setAmsError(t('No AMS detected on this device'));
+        emptyAmsPollCountRef.current = 0;
+        setAmsError(t('Fetching AMS data…'));
       }
     } catch {
       setAmsError(t('Getting device list failed, please retry'));
@@ -1374,7 +1366,8 @@ export function AddEditDialog({
       if (data && data.ams_units.length > 0) {
         setSelectedUnit(data.ams_units[0].ams_id);
       } else {
-        setAmsError(t('No AMS detected on this device'));
+        emptyAmsPollCountRef.current = 0;
+        setAmsError(t('Fetching AMS data…'));
       }
     } catch {
       setAmsError(t('Getting AMS data failed'));
@@ -1397,6 +1390,8 @@ export function AddEditDialog({
       || '';
     if (!devId) return;
     setRefreshBusy(true);
+    emptyAmsPollCountRef.current = 0;
+    setAmsError(t('Fetching AMS data…'));
     try {
       await onRequestPushall(devId);
     } catch {
@@ -1486,7 +1481,24 @@ export function AddEditDialog({
         // when the serialized payload actually differs.
         const prev = amsDataRef.current;
         const same = prev && JSON.stringify(prev) === JSON.stringify(data);
-        if (same) return;
+        if (same) {
+          // Even if snapshot hasn't changed, still handle the "Fetching AMS data…"
+          // transient state so it doesn't get stuck.
+          if (amsErrorRef.current === t('Fetching AMS data…')) {
+            if (data.ams_units.length > 0) {
+              // Device has AMS — clear the transient message immediately.
+              emptyAmsPollCountRef.current = 0;
+              setAmsError('');
+            } else {
+              // Still no AMS — advance counter and upgrade to real error after 2 ticks.
+              emptyAmsPollCountRef.current += 1;
+              if (emptyAmsPollCountRef.current >= 2) {
+                setAmsError(t('No AMS detected on this device'));
+              }
+            }
+          }
+          return;
+        }
 
         setAmsData(data);
 
@@ -1501,9 +1513,15 @@ export function AddEditDialog({
         // the first unit so the slot list renders without the user
         // having to click the AMS icon manually.
         if (data.ams_units.length > 0) {
+          emptyAmsPollCountRef.current = 0;
           if (amsErrorRef.current) setAmsError('');
           if (selectedUnitRef.current == null) {
             setSelectedUnit(data.ams_units[0].ams_id);
+          }
+        } else if (amsErrorRef.current === t('Fetching AMS data…')) {
+          emptyAmsPollCountRef.current += 1;
+          if (emptyAmsPollCountRef.current >= 2) {
+            setAmsError(t('No AMS detected on this device'));
           }
         }
 
@@ -1559,7 +1577,7 @@ export function AddEditDialog({
     let cancelled = false;
     const tick = async () => {
       try {
-        const list = await onFetchMachines();
+        const { machines: list } = await onFetchMachines();
         if (cancelled || !Array.isArray(list)) return;
         const prev = machinesRef.current;
         if (JSON.stringify(prev) === JSON.stringify(list)) return;
@@ -1846,7 +1864,6 @@ export function AddEditDialog({
   if (!open) return null;
 
   const currentUnit = amsData?.ams_units.find((u) => u.ams_id === selectedUnit);
-  const slotLabels = ['A1', 'A2', 'A3', 'A4'];
   // STUDIO-18344: form lock + form visibility derive from the new selection
   // model. Multi-select (>=2) hides the form entirely, so the lock flags
   // only matter in single-select mode.
@@ -1854,10 +1871,12 @@ export function AddEditDialog({
   const isAmsMultiSelect = mode === 'ams' && slotSelectionCount >= 2;
   const isAmsSingleSelect = mode === 'ams' && slotSelectionCount === 1;
   const amsFieldLocked = isAmsSingleSelect;
-  const lockBrand = amsFieldLocked && amsLockedFields.brand;
-  const lockMaterial = amsFieldLocked && amsLockedFields.material;
-  const lockColor = amsFieldLocked && amsLockedFields.color;
-  const lockWeight = amsFieldLocked && amsLockedFields.weight;
+  // When editing an existing RFID spool, lock everything except the note field.
+  const isRfidEdit = isEdit && hasCloudRfid(initSpool?.tag_uid ?? '');
+  const lockBrand = (amsFieldLocked && amsLockedFields.brand) || isRfidEdit;
+  const lockMaterial = (amsFieldLocked && amsLockedFields.material) || isRfidEdit;
+  const lockColor = (amsFieldLocked && amsLockedFields.color) || isRfidEdit;
+  const lockWeight = (amsFieldLocked && amsLockedFields.weight) || isRfidEdit;
   // Snapshot of (unit, tray) pairs for the batch summary panel. Resolved
   // against the live `amsData` so a slot whose tray was just pulled drops
   // out automatically on the next render (the poll-prune effect will catch
@@ -2045,7 +2064,7 @@ export function AddEditDialog({
                   </div>
                   <div className="flex gap-[8px] py-[8px]">
                     {currentUnit.trays.map((tray, i) => {
-                      const label = slotLabels[i] || `A${i + 1}`;
+                      const label = tray.tray_label || `${String.fromCharCode(65 + Math.floor(i / 4))}${(i % 4) + 1}`;
                       const slotKey = `${currentUnit.ams_id}:${tray.slot_id}`;
                       const isSelected = selectedSlotKeys.has(slotKey);
                       if (!tray.is_exists) {

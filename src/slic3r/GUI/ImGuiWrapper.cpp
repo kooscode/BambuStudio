@@ -34,8 +34,12 @@
 #include "I18N.hpp"
 #include "Search.hpp"
 #include "BitmapCache.hpp"
+#include "FilamentBitmapUtils.hpp"
 
 #include "../Utils/MacDarkMode.hpp"
+#ifdef __APPLE__
+#include "MacIME.hpp"
+#endif
 #include "nanosvg/nanosvg.h"
 #include "nanosvg/nanosvgrast.h"
 #include "OpenGLManager.hpp"
@@ -556,6 +560,13 @@ void ImGuiWrapper::new_frame()
 
 void ImGuiWrapper::render()
 {
+#ifdef __APPLE__
+    // Keep the focused canvas's IME context current for the whole time a text
+    // field wants input, so the macOS Chinese/English toggle and other
+    // modifier-only events reach it (see MacIME.hpp).
+    if (void *view = ImGui::GetIO().ImeWindowHandle)
+        mac_ime_sync_active(view, ImGui::GetIO().WantTextInput);
+#endif
     ImGui::Render();
     render_draw_data(ImGui::GetDrawData());
     m_new_frame_open = false;
@@ -2905,6 +2916,18 @@ void ImGuiWrapper::init_input()
     // Don't let imgui special-case Mac, wxWidgets already do that
     io.ConfigMacOSXBehaviors = false;
 
+#ifdef __APPLE__
+    // Forward the input cursor position imgui reports for the focused text widget
+    // to the macOS IME bridge so the candidate window is anchored at the caret.
+    // io.ImeWindowHandle carries the focused canvas NSView (set on focus change).
+    io.ImeSetInputScreenPosFn = [](int x, int y) {
+        if (void *view = ImGui::GetIO().ImeWindowHandle)
+            mac_ime_set_caret(view, x, y, 0);
+    };
+#endif
+    // Windows: keep imgui's default ImeSetInputScreenPosFn (ImmSetCompositionWindow).
+    // It needs io.ImeWindowHandle = canvas HWND, set in GLCanvas3D focus / ImGui click.
+
     // Setup clipboard interaction callbacks
     io.SetClipboardTextFn = clipboard_set;
     io.GetClipboardTextFn = clipboard_get;
@@ -3180,29 +3203,141 @@ std::tuple<ImVec2, bool>  ImGuiWrapper::calculate_filament_group_text_size(const
     return { { final_width,final_height },is_multiline };
 }
 
+static ImU32 wxcolour_to_imu32(const wxColour& c)
+{
+    return IM_COL32(c.Red(), c.Green(), c.Blue(), c.Alpha());
+}
+
+// Draw a checkerboard pattern into draw_list over the inset rect, mirroring
+// FilamentBitmapUtils::draw_checkerboard.
+static void draw_checkerboard_swatch(ImDrawList* draw_list, const ImVec2& p_min, const ImVec2& p_max,
+                                     ImU32 color_light, ImU32 color_dark, float inset)
+{
+    const float x0 = p_min.x + inset, y0 = p_min.y + inset;
+    const float x1 = p_max.x - inset, y1 = p_max.y - inset;
+    const float square = std::max(6.f, std::min(x1 - x0, y1 - y0) / 8.f);
+
+    int iy = 0;
+    for (float y = y0; y < y1; y += square, ++iy) {
+        int ix = 0;
+        for (float x = x0; x < x1; x += square, ++ix) {
+            const bool  is_light = (ix + iy) % 2 == 0;
+            const float xr = std::min(x + square, x1);
+            const float yr = std::min(y + square, y1);
+            draw_list->AddRectFilled(ImVec2(x, y), ImVec2(xr, yr), is_light ? color_light : color_dark);
+        }
+    }
+}
+
+// Draw a single-color filament swatch into draw_list over [p_min, p_max], mirroring
+// create_single_filament_bitmap: transparent -> gray checkerboard, semi-transparent ->
+// two-shade checkerboard blended over white, opaque -> solid fill; borders match the bitmap.
+static void draw_single_color_swatch(ImDrawList* draw_list, const ImVec2& p_min, const ImVec2& p_max,
+                                     const wxColour& color)
+{
+    const bool is_dark_mode = wxGetApp().dark_mode();
+
+    // Fully transparent: white/gray checkerboard, gray border in light mode only.
+    if (color.Alpha() == 0) {
+        const float inset = is_dark_mode ? 0.f : 1.f;
+        draw_checkerboard_swatch(draw_list, p_min, p_max,
+                                 IM_COL32(255, 255, 255, 255), IM_COL32(217, 217, 217, 255), inset);
+        if (!is_dark_mode)
+            draw_list->AddRect(p_min, p_max, IM_COL32(130, 130, 128, 255));
+        return;
+    }
+
+    // Semi-transparent: checkerboard of the color blended over white, solid-color border.
+    if (color.Alpha() != wxALPHA_OPAQUE) {
+        auto blend = [](wxByte c, double a) -> int {
+            return (int) (c * a + 255.0 * (1.0 - a) + 0.5);
+        };
+        const ImU32 light_clr = IM_COL32(blend(color.Red(), 0.45), blend(color.Green(), 0.45), blend(color.Blue(), 0.45), 255);
+        const ImU32 dark_clr  = IM_COL32(blend(color.Red(), 0.70), blend(color.Green(), 0.70), blend(color.Blue(), 0.70), 255);
+        draw_checkerboard_swatch(draw_list, p_min, p_max, light_clr, dark_clr, 1.f);
+        draw_list->AddRect(p_min, p_max, IM_COL32(color.Red(), color.Green(), color.Blue(), 255));
+        return;
+    }
+
+    // Opaque: solid fill, with a contrasting border for near-white / near-black colors.
+    draw_list->AddRectFilled(p_min, p_max, IM_COL32(color.Red(), color.Green(), color.Blue(), 255));
+    if (!is_dark_mode && color.Red() > 224 && color.Green() > 224 && color.Blue() > 224)
+        draw_list->AddRect(p_min, p_max, IM_COL32(130, 130, 128, 255));
+    else if (is_dark_mode && color.Red() < 45 && color.Green() < 45 && color.Blue() < 45)
+        draw_list->AddRect(p_min, p_max, IM_COL32(207, 207, 207, 255));
+}
+
+// Draw a multi-color filament swatch into draw_list over [p_min, p_max], mirroring
+// create_filament_bitmap's layout: dual = left/right split, triple = vertical thirds,
+// quad = 2x2, gradient (and 5+ colors) = horizontal gradient segments. Assumes colors.size() > 1.
+static void draw_multi_color_swatch(ImDrawList* draw_list, const ImVec2& p_min, const ImVec2& p_max,
+                                    const std::vector<wxColour>& colors, bool is_gradient)
+{
+    const float x0 = p_min.x, y0 = p_min.y, x1 = p_max.x, y1 = p_max.y;
+    const size_t n = colors.size();
+
+    if (is_gradient || n > 4) {
+        const int   seg_count = (int) n - 1;
+        const float seg_w     = (x1 - x0) / (float) seg_count;
+        float       left      = x0;
+        for (int i = 0; i < seg_count; ++i) {
+            const float right = (i == seg_count - 1) ? x1 : left + seg_w;
+            const ImU32 c_l = wxcolour_to_imu32(colors[i]);
+            const ImU32 c_r = wxcolour_to_imu32(colors[i + 1]);
+            draw_list->AddRectFilledMultiColor(ImVec2(left, y0), ImVec2(right, y1), c_l, c_r, c_r, c_l);
+            left = right;
+        }
+    } else if (n == 2) {
+        const float xm = std::round(0.5f * (x0 + x1));
+        draw_list->AddRectFilled(ImVec2(x0, y0), ImVec2(xm, y1), wxcolour_to_imu32(colors[0]));
+        draw_list->AddRectFilled(ImVec2(xm, y0), ImVec2(x1, y1), wxcolour_to_imu32(colors[1]));
+    } else if (n == 3) {
+        const float w  = (x1 - x0) / 3.f;
+        const float xa = x0 + w, xb = x0 + 2.f * w;
+        draw_list->AddRectFilled(ImVec2(x0, y0), ImVec2(xa, y1), wxcolour_to_imu32(colors[0]));
+        draw_list->AddRectFilled(ImVec2(xa, y0), ImVec2(xb, y1), wxcolour_to_imu32(colors[1]));
+        draw_list->AddRectFilled(ImVec2(xb, y0), ImVec2(x1, y1), wxcolour_to_imu32(colors[2]));
+    } else { // exactly 4
+        const float xm = std::round(0.5f * (x0 + x1));
+        const float ym = std::round(0.5f * (y0 + y1));
+        draw_list->AddRectFilled(ImVec2(x0, y0), ImVec2(xm, ym), wxcolour_to_imu32(colors[0]));
+        draw_list->AddRectFilled(ImVec2(xm, y0), ImVec2(x1, ym), wxcolour_to_imu32(colors[1]));
+        draw_list->AddRectFilled(ImVec2(x0, ym), ImVec2(xm, y1), wxcolour_to_imu32(colors[2]));
+        draw_list->AddRectFilled(ImVec2(xm, ym), ImVec2(x1, y1), wxcolour_to_imu32(colors[3]));
+    }
+}
+
 void ImGuiWrapper::filament_group(const std::string& filament_type, const char* hex_color, unsigned char filament_id, float align_width)
 {
     //ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     std::string id = std::to_string(static_cast<unsigned int> (filament_id + 1));
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    static ImTextureID transparent;
     ImVec2             text_size = ImGui::CalcTextSize(filament_type.c_str());
     // BBS image sizing based on text width (DPI scaling)
     float         img_width = ImGui::CalcTextSize("ABC").x;
     ImVec2        img_size = { img_width, img_width };
     ImVec2        id_text_size = this->calc_text_size(id);
+
+    // Full color set for this filament (gradient / dual / multi); single-color falls back to hex_color.
+    std::vector<wxColour> multi_colors;
+    bool                  is_gradient = false;
+    get_filament_colors_by_id(static_cast<int>(filament_id), multi_colors, is_gradient);
+    const bool is_multi_color = multi_colors.size() > 1;
+    // The id label's contrast is driven by the primary (first) color; fall back to the passed hex_color.
+    const std::string primary_color = multi_colors.empty() ? std::string(hex_color)
+                                                           : multi_colors.front().GetAsString(wxC2S_HTML_SYNTAX).ToStdString();
+
     unsigned char rgba[4];
     rgba[3] = 0xff;
-    Slic3r::GUI::BitmapCache::parse_color4(hex_color, rgba);
-    std::string svg_path = "/images/outlined_rect.svg";
-    if (rgba[3] == 0x00) {
-        svg_path = "/images/outlined_rect_transparent.svg";
-    }
-    BitmapCache::load_from_svg_file_change_color(Slic3r::resources_dir() + svg_path, img_size.x, img_size.y, transparent, hex_color);
+    Slic3r::GUI::BitmapCache::parse_color4(primary_color, rgba);
     ImGui::BeginGroup();
     {
         ImVec2 cursor_pos = ImGui::GetCursorScreenPos();
-        draw_list->AddImage(transparent, cursor_pos, { cursor_pos.x + img_size.x, cursor_pos.y + img_size.y }, { 0, 0 }, { 1, 1 }, ImGui::GetColorU32(ImVec4(1.f, 1.f, 1.f, 1.f)));
+        const ImVec2 swatch_max = { cursor_pos.x + img_size.x, cursor_pos.y + img_size.y };
+        if (is_multi_color)
+            draw_multi_color_swatch(draw_list, cursor_pos, swatch_max, multi_colors, is_gradient);
+        else
+            draw_single_color_swatch(draw_list, cursor_pos, swatch_max, wxColour(rgba[0], rgba[1], rgba[2], rgba[3]));
         // image border test
         // draw_list->AddRect(cursor_pos, {cursor_pos.x + img_size.x, cursor_pos.y + img_size.y}, IM_COL32(0, 0, 0, 255));
         ImVec2 current_cursor = ImGui::GetCursorPos();

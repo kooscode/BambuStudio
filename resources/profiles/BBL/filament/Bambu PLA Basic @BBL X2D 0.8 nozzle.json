@@ -1,9 +1,9 @@
 {
     "type": "filament",
-    "name": "Bambu PLA Basic @BBL X2D",
+    "name": "Bambu PLA Basic @BBL X2D 0.8 nozzle",
     "inherits": "Bambu PLA Basic @base",
     "from": "system",
-    "setting_id": "GFSA00_09",
+    "setting_id": "GFSA00_55",
     "instantiation": "true",
     "counter_coef_2": [
         "0.0025"
@@ -29,11 +29,29 @@
         "10",
         "10"
     ],
+    "filament_dev_ams_drying_temperature": [
+        "45",
+        "45",
+        "45",
+        "45"
+    ],
+    "filament_dev_ams_drying_time": [
+        "12",
+        "12",
+        "12",
+        "12"
+    ],
     "filament_flow_ratio": [
         "0.98",
         "0.98",
         "0.98",
         "0.98"
+    ],
+    "filament_flush_temp_fast": [
+        "0",
+        "0",
+        "0",
+        "0"
     ],
     "filament_max_volumetric_speed": [
         "21",
@@ -129,7 +147,6 @@
         "40"
     ],
     "compatible_printers": [
-        "Bambu Lab X2D 0.6 nozzle",
         "Bambu Lab X2D 0.8 nozzle"
     ],
     "filament_start_gcode": [

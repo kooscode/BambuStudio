@@ -22,6 +22,7 @@ enum class DeviceWebHostMode {
 
 class DeviceWebHost : public wxPanel {
 public:
+    using ContentSizeChangedHandler = std::function<void(const wxSize&)>;
     // allow_lazy: if true, webview/bridge/manager construction is deferred until
     // the panel is first shown, avoiding startup cost for hidden tabs.
     explicit DeviceWebHost(wxWindow* parent, DeviceWebHostMode mode,
@@ -42,6 +43,13 @@ public:
 
     void NotifyFilamentSessionState();
     void NotifyFilamentMachineChanged();
+    void NotifyDeviceFilamentChanged();
+    void NotifyAmsMappingChanged();
+    // Dispatch a JSON-RPC command directly to the matching ViewModel (fire-and-forget).
+    // body must contain: module, submod, action, payload.
+    void DispatchCommand(const nlohmann::json& body);
+    void SetContentSizeChangedHandler(ContentSizeChangedHandler handler) { m_content_size_changed_handler = std::move(handler); }
+
 
     void on_sys_color_changed();
     void msw_rescale();
@@ -69,6 +77,22 @@ private:
     std::unique_ptr<DeviceHttpServer> m_device_http_server;
     std::unique_ptr<DeviceWebBridge>  m_device_web_bridge;
     std::unique_ptr<DeviceWebManager> m_device_web_mgr;
+    ContentSizeChangedHandler         m_content_size_changed_handler;
+    wxSize                            m_last_reported_content_size{ wxDefaultSize };
+    // Last web-reported size in DPI-independent CSS pixels (before FromDIP()).
+    // Used to rebuild the physical min size at the current DPI on show.
+    wxSize                            m_last_logical_content_size{ wxDefaultSize };
+
+#if defined(__WXOSX__)
+    static void OnWKContentProcessCrash(void* context);
+    void RecoverFromCrash();
+    std::shared_ptr<bool>             m_alive_flag;
+    // Web Content 进程崩溃后的自动恢复次数上限。超过后停止自动重试，
+    // 避免在页面持续崩溃时无限重载（此时多为环境/页面自身问题，自动恢复无意义）。
+    // 成功加载一次新页面（见 RecoverFromCrash 注释）后会在下次正常导航时复位。
+    static constexpr int              kMaxCrashRecoveryAttempts = 3;
+    int                               m_crash_recovery_count{ 0 };
+#endif
 };
 
 } // namespace GUI

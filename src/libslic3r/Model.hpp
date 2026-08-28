@@ -830,6 +830,19 @@ private:
 
     // To access set_new_unique_id() when copy / pasting a ModelVolume.
     friend class ModelVolume;
+    // Scratch buffer for two-phase paint keep (compute then commit). Needs
+    // friendship because FacetsAnnotation constructors are private.
+    friend struct PaintKeepPrepared;
+};
+
+// Holds a repaired mesh plus re-projected paint layers before commit.
+// Constructible outside ModelVolume (unlike bare FacetsAnnotation).
+struct PaintKeepPrepared {
+    TriangleMesh     mesh;
+    FacetsAnnotation supported;
+    FacetsAnnotation seam;
+    FacetsAnnotation mmu;
+    FacetsAnnotation fuzzy;
 };
 
 struct RaycastResult
@@ -919,6 +932,13 @@ public:
         float            height{0.f};
         float            radius_tolerance{0.f}; // [0.f : 1.f]
         float            height_tolerance{0.f}; // [0.f : 1.f]
+        // Index of the volume this piece was cut from, inside the object being cut.
+        // Only meaningful while a cut is in progress: the groove cut applies several
+        // cut planes in a row, so it needs to tell which pieces belong to the same
+        // source part and may be merged back together.
+        // Not listed in serialize() below: this is transient scratch state, so it is neither
+        // written to 3mf nor preserved across an undo/redo snapshot.
+        int              source_part_idx{-1};
 
         CutInfo() = default;
         CutInfo(CutConnectorType type, float radius_, float height_, float rad_tolerance, float h_tolerance, bool processed = false)
@@ -992,10 +1012,29 @@ public:
     void                set_material_id(t_model_material_id material_id);
     void                reset_extra_facets();
     // BBS: best-effort paint preservation across mesh-rebuilding operations
-    // (repair/simplify/smooth). Replaces the mesh, then re-projects all four
-    // paint layers from the OLD mesh onto the new one by nearest-surface lookup.
-    // Approximate: a remeshed surface has no exact face correspondence.
-    void                set_mesh_keep_paint(TriangleMesh &&mesh);
+    // (repair/simplify/smooth). Re-projects all four paint layers from the OLD
+    // mesh onto the new one by nearest-surface lookup, then commits the new mesh
+    // and paint atomically. Approximate: a remeshed surface has no exact face
+    // correspondence.
+    // Optional progress (percent in [0,100]) and cancel callbacks drive a UI and
+    // allow aborting the (potentially long) reprojection. Returns false if the
+    // operation was canceled, in which case the mesh and paint are left unchanged;
+    // true otherwise.
+    bool                set_mesh_keep_paint(TriangleMesh &&mesh,
+                                            const std::function<void(int, const char *)> &progress = nullptr,
+                                            const std::function<bool()> &cancel = nullptr);
+    // Split of set_mesh_keep_paint into a read-only compute step and a commit step,
+    // so a caller repairing several volumes can compute them all first and only
+    // commit once every volume succeeds (object-level all-or-nothing on cancel).
+    // reproject_paint_keep fills out's annotation layers from the current mesh/paint
+    // onto new_mesh WITHOUT mutating this volume (out.mesh is left untouched); returns
+    // false if canceled (out annotations are then unspecified).
+    bool                reproject_paint_keep(const TriangleMesh &new_mesh,
+                                             PaintKeepPrepared &out,
+                                             const std::function<void(int, const char *)> &progress = nullptr,
+                                             const std::function<bool()> &cancel = nullptr) const;
+    // Commits a previously computed new mesh and its re-projected paint layers.
+    void                commit_mesh_keep_paint(PaintKeepPrepared &&prepared);
     ModelMaterial*      material() const;
     void                set_material(t_model_material_id material_id, const ModelMaterial &material);
     // Extract the current extruder ID based on this ModelVolume's config and the parent ModelObject's config.
@@ -1036,6 +1075,9 @@ public:
     void                calculate_convex_hull();
     const TriangleMesh& get_convex_hull() const;
     const std::shared_ptr<const TriangleMesh>& get_convex_hull_shared_ptr() const { return m_convex_hull; }
+    // Share an already-computed convex hull (e.g. rebind the assembly-view volume to the prepare-side
+    // hull after a prepare-side mesh edit) without recomputing it.
+    void                set_convex_hull_shared_ptr(const std::shared_ptr<const TriangleMesh> &hull) { m_convex_hull = hull; }
     //BBS: add convex_hell_2d related logic
     const Polygon& get_convex_hull_2d(const Transform3d &trafo_instance) const;
     void invalidate_convex_hull_2d()
@@ -1113,6 +1155,20 @@ public:
         m_origin_mesh_or_vertice_render = is_mesh;
     }
     bool get_origin_mesh_or_vertice_render()const {return m_origin_mesh_or_vertice_render;}
+
+    // Stable cross-model logical-part identity (assembly view independent model). Persisted in 3mf.
+    const std::string &part_guid() const { return m_part_guid; }
+    void               set_part_guid(const std::string &guid) { m_part_guid = guid; }
+    // Lazily assign a stable part GUID if none has been set yet, then return it.
+    const std::string &ensure_part_guid(bool force = false) const;
+    // Assembly-side only: the prepare-side part_guid this volume references. Empty in the prepare model.
+    const std::string& assembly_src_guid() const { return m_assembly_src_guid; }
+    void               set_assembly_src_guid(const std::string &guid) { m_assembly_src_guid = guid; }
+    // Per-volume printable. On the assembly model this is the sole printable source of truth
+    // (object/instance printable stay true); prepare-side unprintable maps here per part so a
+    // multipart assembly MO can grey only the matching volume.
+    bool printable() const { return m_printable; }
+    void set_printable(bool v) { m_printable = v; }
 protected:
 	friend class Print;
     friend class SLAPrint;
@@ -1146,6 +1202,15 @@ private:
     // BBS: per-volume assemble transformation, mirrors ModelInstance::m_assemble_transformation.
     mutable Geometry::Transformation    m_assemble_transformation;
     bool                                m_assemble_initialized{false};
+
+    // Stable, persisted cross-model logical-part identity (assembly view independent model).
+    // Lazily generated; equal on a prepare-side volume and its assembly-side counterpart.
+    mutable std::string                 m_part_guid;
+    // Assembly-side only: the prepare-side part_guid this volume references. Empty in the prepare model.
+    std::string                         m_assembly_src_guid;
+    // Default true. Assembly-side printable is ModelVolume-only; sync writes prepare
+    // object/instance printable here per part and keeps assembly object/instance printable.
+    bool                                m_printable{true};
 
     TextInfo m_text_info;
 
@@ -1219,6 +1284,8 @@ private:
         , seam_facets(other.seam_facets)
         , mmu_segmentation_facets(other.mmu_segmentation_facets)
         , m_text_info(other.m_text_info), emboss_shape(other.emboss_shape)
+        , m_part_guid(other.m_part_guid), m_assembly_src_guid(other.m_assembly_src_guid)
+        , m_printable(other.m_printable)
     {
 		assert(this->id().valid());
         assert(this->config.id().valid());
@@ -1244,7 +1311,8 @@ private:
         name(other.name), source(other.source), m_mesh(new TriangleMesh(std::move(mesh))), config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         m_assemble_transformation(other.m_assemble_transformation),
         m_assemble_initialized(other.m_assemble_initialized),
-        emboss_shape(other.emboss_shape)
+        emboss_shape(other.emboss_shape),
+        m_printable(other.m_printable)
     {
 		assert(this->id().valid());
         assert(this->config.id().valid());
@@ -1295,7 +1363,7 @@ private:
         // BBS: add backup, check modify
         bool mesh_changed = false;
         auto tr = m_transformation;
-        ar(name, source, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull, m_text_info, cut_info, m_assemble_transformation, m_assemble_initialized);
+        ar(name, source, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull, m_text_info, cut_info, m_assemble_transformation, m_assemble_initialized, m_part_guid, m_assembly_src_guid, m_printable);
         mesh_changed |= !(tr == m_transformation);
         auto t = supported_facets.timestamp();
         cereal::load_by_value(ar, supported_facets);
@@ -1324,7 +1392,7 @@ private:
 	}
 	template<class Archive> void save(Archive &ar) const {
 		bool has_convex_hull = m_convex_hull.get() != nullptr;
-        ar(name, source, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull, m_text_info, cut_info, m_assemble_transformation, m_assemble_initialized);
+        ar(name, source, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull, m_text_info, cut_info, m_assemble_transformation, m_assemble_initialized, m_part_guid, m_assembly_src_guid, m_printable);
         cereal::save_by_value(ar, supported_facets);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, seam_facets);
@@ -1614,6 +1682,8 @@ public:
 
     std::string                         step_import_path;
     std::vector<StepImportTreeNode>     step_import_tree_nodes;
+    // Debug-only marker: true for the independent assembly-view model (a_model), false for the prepare model.
+    bool                                is_assembly_model = false;
     // Wipe tower object.
     ModelWipeTower	wipe_tower;
     // BBS static members store extruder parameters and speed map of all models
@@ -1667,6 +1737,17 @@ public:
     const std::string& get_assembly_steps_json_str() const { return m_assembly_steps_json_str; }
     std::string&       get_assembly_steps_json_str()       { return m_assembly_steps_json_str; }
     void               set_assembly_steps_json_str(std::string json_str) { m_assembly_steps_json_str = std::move(json_str); }
+
+    // Independent assembly-model object graph, serialized as JSON (no geometry: each volume references a
+    // prepare-side part by assembly_src_guid and the mesh is rebound on load). Persisted to 3mf as a
+    // standalone section so assembly-view structural state (deletes / appends / poses) survives reload.
+    const std::string& get_assembly_model_json_str() const { return m_assembly_model_json_str; }
+    std::string&       get_assembly_model_json_str()       { return m_assembly_model_json_str; }
+    void               set_assembly_model_json_str(std::string json_str) { m_assembly_model_json_str = std::move(json_str); }
+
+    // Drop assembly tree / steps / a_model JSON. clear_objects() does not touch these; call on project
+    // reset so the next STEP/3mf open does not re-derive leftover empty steps from the prepare model.
+    void clear_assembly_artifacts();
 
     // Extensions for color print
     // CustomGCode::Info custom_gcode_per_print_z;
@@ -1825,11 +1906,11 @@ private:
 	friend class UndoRedo::StackImpl;
     template<class Archive> void load(Archive& ar) {
         Internal::StaticSerializationWrapper<ModelWipeTower> wipe_tower_wrapper(wipe_tower);
-        ar(materials, objects, wipe_tower_wrapper);
+        ar(materials, objects, wipe_tower_wrapper, m_assembly_tree_json_str, m_assembly_steps_json_str, m_assembly_model_json_str);
     }
     template<class Archive> void save(Archive& ar) const {
         Internal::StaticSerializationWrapper<ModelWipeTower const> wipe_tower_wrapper(wipe_tower);
-        ar(materials, objects, wipe_tower_wrapper);
+        ar(materials, objects, wipe_tower_wrapper, m_assembly_tree_json_str, m_assembly_steps_json_str, m_assembly_model_json_str);
     }
 
     //BBS: add aux temp directory
@@ -1843,6 +1924,7 @@ private:
     std::string           m_assembly_tree_json_str;
     AssemblyStepsTreeData m_assembly_steps_tree_data;
     std::string           m_assembly_steps_json_str;
+    std::string           m_assembly_model_json_str;
 };
 
 #undef OBJECTBASE_DERIVED_COPY_MOVE_CLONE

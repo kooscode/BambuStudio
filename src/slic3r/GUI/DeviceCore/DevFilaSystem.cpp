@@ -71,6 +71,7 @@ void DevAmsTray::reset()
     is_bbl              = false;
     hold_count          = 0;
     remain              = 0;
+    remain_g            = -1;
 }
 
 
@@ -589,6 +590,7 @@ DevAms* DevFilaSystemParser::ParseAmsInfo(const json& j_ams, MachineObject* obj,
     std::set<int> binded_extruder_set;
     std::optional<DevFilaSwitch::SwitchPos> binded_switcher_pos;
     auto type_id = DevAmsType::AMS; // 0:dummy 1:ams 2:ams-lite 3:n3f 4:n3s
+    auto remain_estimate_version = DevAms::RemainEstimateVersion::Legacy;
 
     /*ams info*/
     if (j_ams.contains("info")) {
@@ -611,6 +613,8 @@ DevAms* DevFilaSystemParser::ParseAmsInfo(const json& j_ams, MachineObject* obj,
         } else{
             binded_extruder_set = { extuder_id };
         }
+
+        remain_estimate_version = static_cast<DevAms::RemainEstimateVersion>(DevUtil::get_flag_bits(info, 30, 2));
     } else {
         binded_extruder_set = { MAIN_EXTRUDER_ID }; // Default extruder id
         if (!obj->is_enable_ams_np && obj->get_printer_ams_type() == "f1") {
@@ -643,6 +647,7 @@ DevAms* DevFilaSystemParser::ParseAmsInfo(const json& j_ams, MachineObject* obj,
 
     curr_ams->m_binded_switcher_pos = binded_switcher_pos;
     curr_ams->m_binded_extruder_set = binded_extruder_set;
+    curr_ams->m_remain_estimate_version = remain_estimate_version;
 
     /*set ams exist flag*/
     try {
@@ -761,9 +766,21 @@ DevAmsTray* DevFilaSystemParser::ParseAmsTrayInfo(const json& j_tray, MachineObj
     curr_tray->current_extruder_id = curr_ams->GetCurrentExtruderId();
     curr_tray->binded_extruder_set = curr_ams->GetBindedExtruderSet();
     curr_tray->binded_switcher_pos = curr_ams->GetSwitcherPos();
+    // 把 is_exists 更新提前到 hold_count 守卫之前：物理插拔状态（feed-hall 传感器
+    // 的 tray_exist_bits）需要始终即时反映到 UI，不应受 hold 机制影响。
+    // hold 的用途是防止 slicer 发出 ams_filament_setting 之后紧接收到旧的
+    // push_status 而把类型/颜色等 identity 字段回滚，与物理在位状态无关。
+    int ams_id_int = 0;
+    int tray_id_int = 0;
+    try {
+        tray_id_int = atoi(curr_tray->id.c_str());
+        curr_tray->is_exists = DevUtil::get_flag_bits(obj->tray_exist_bits, curr_ams->GetTrayId(tray_id_int));
+    } catch (...) {
+    }
+
     if (curr_tray->hold_count > 0) {
         curr_tray->hold_count--;
-        return curr_tray;
+        return curr_tray;   // 只跳过类型/颜色等 identity 字段，is_exists 已更新
     }
 
     DevJsonValParser::ParseVal(j_tray, "tag_uid", curr_tray->tag_uid, std::string("0"));
@@ -826,14 +843,6 @@ DevAmsTray* DevFilaSystemParser::ParseAmsTrayInfo(const json& j_tray, MachineObj
         }
     }
 
-    int ams_id_int = 0;
-    int tray_id_int = 0;
-    try {
-        tray_id_int = atoi(curr_tray->id.c_str());
-        curr_tray->is_exists = DevUtil::get_flag_bits(obj->tray_exist_bits, curr_ams->GetTrayId(tray_id_int));
-    } catch (...) {
-    }
-
     // Calibration k, n, cali_idx
     auto curr_time = std::chrono::system_clock::now();
     auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(curr_time - obj->extrusion_cali_set_hold_start);
@@ -845,6 +854,13 @@ DevAmsTray* DevFilaSystemParser::ParseAmsTrayInfo(const json& j_tray, MachineObj
     }
 
     DevJsonValParser::ParseVal(j_tray, "cali_idx", curr_tray->cali_idx);
+
+    if (j_tray.contains("state")) {
+        const int state = DevJsonValParser::GetVal<int>(j_tray, "state");
+        curr_tray->remain_fetch_status =
+            static_cast<DevAmsTray::RemainFetchStatus>((state >> 5) & 0x7);
+    }
+
     return curr_tray;
 }
 

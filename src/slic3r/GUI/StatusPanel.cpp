@@ -1,4 +1,7 @@
 #include "StatusPanel.hpp"
+
+#include <algorithm>
+
 #include "I18N.hpp"
 #include "Widgets/Label.hpp"
 #include "Widgets/Button.hpp"
@@ -44,6 +47,7 @@
 
 #include "DeviceCore/DevStatus.h"
 
+#include "DeviceWeb/DeviceWebPage.hpp"
 #include "DeviceCore/DevConfig.h"
 #include "DeviceCore/DevConfigUtil.h"
 #include "DeviceCore/DevInfo.h"
@@ -1031,6 +1035,12 @@ void PrintingTaskPanel::create_panel(wxWindow *parent)
     m_gauge_progress = new ProgressBar(progress_lr_panel, wxID_ANY, 100, wxDefaultPosition, wxDefaultSize);
     m_gauge_progress->SetValue(0);
     m_gauge_progress->SetHeight(PROGRESSBAR_HEIGHT);
+    m_gauge_progress->Bind(EVT_PROGRESS_BAR_HEIGHT_CHANGED, [this, progress_lr_panel](wxCommandEvent &) {
+        progress_lr_panel->InvalidateBestSize();
+        progress_lr_panel->Layout();
+        InvalidateBestSize();
+        Layout();
+    });
 
     wxBoxSizer *bSizer_task_btn = new wxBoxSizer(wxHORIZONTAL);
 
@@ -1128,10 +1138,17 @@ void PrintingTaskPanel::create_panel(wxWindow *parent)
     m_staticText_layers->SetForegroundColour(wxColour(107, 107, 107));
     m_staticText_layers->Hide();
 
+    m_staticTextPauses = new wxStaticText(penel_text, wxID_ANY, _L("Pause") + ": N/A");
+    m_staticTextPauses->SetFont(wxFont(12, wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_NORMAL,
+                                      false, wxT("HarmonyOS Sans SC")));
+    m_staticTextPauses->SetForegroundColour(wxColour(107, 107, 107));
+    m_staticTextPauses->Hide();
+
     bSizer_text->Add(sizer_percent, 0, wxEXPAND, 0);
     bSizer_text->Add(sizer_percent_icon, 0, wxEXPAND, 0);
     bSizer_text->Add(0, 0, 1, wxEXPAND, 0);
-    bSizer_text->Add(m_staticText_layers, 0, wxALIGN_CENTER_VERTICAL | wxALL, 0);
+    bSizer_text->Add(m_staticTextPauses, 0, wxALIGN_CENTER_VERTICAL | wxALL, 0);
+    bSizer_text->Add(m_staticText_layers, 0, wxALIGN_CENTER_VERTICAL | wxLEFT, FromDIP(20));
     bSizer_text->Add(0, 0, 0, wxLEFT, FromDIP(20));
     bSizer_text->Add(m_staticText_progress_left, 0, wxALIGN_CENTER_VERTICAL | wxALL, 0);
 
@@ -1524,21 +1541,37 @@ void PrintingTaskPanel::init_scaled_buttons()
     m_button_clean->SetCornerRadius(FromDIP(12));
 }
 
-void PrintingTaskPanel::error_info_reset()
+bool PrintingTaskPanel::error_info_reset()
 {
-    if (m_panel_error_txt->IsShown()) {
-        m_staticline->Hide();
-        m_panel_error_txt->Hide();
-        m_panel_error_txt->GetParent()->Layout();
-        m_error_text->SetLabel(wxEmptyString);
-    }
+    if (!m_panel_error_txt->IsShown()) return false;
+
+    m_error_text->SetLabel(wxEmptyString);
+    m_staticline->Hide();
+    m_panel_error_txt->Hide();
+    refreshErrorContents();
+    return true;
 }
 
-void PrintingTaskPanel::show_error_msg(wxString msg)
+void PrintingTaskPanel::show_error_msg(const wxString &msg)
 {
     m_staticline->Show();
     m_panel_error_txt->Show();
+
+    // Give the auto-wrapping label its final width before assigning the message.
+    Layout();
+    m_panel_error_txt->Layout();
     m_error_text->SetLabel(msg);
+    m_panel_error_txt->Layout();
+    refreshErrorContents();
+}
+
+void PrintingTaskPanel::refreshErrorContents()
+{
+    Layout();
+    InvalidateBestSize();
+    m_error_text->Refresh();
+    m_panel_error_txt->Refresh();
+    Refresh();
 }
 
 void PrintingTaskPanel::reset_printing_value()
@@ -1749,6 +1782,52 @@ void PrintingTaskPanel::update_layers_num(bool show, wxString num)
         m_staticText_layers->Show(false);
         m_staticText_layers->SetLabelText(num);
     }
+}
+
+void PrintingTaskPanel::updatePauseNum(bool show, wxString num)
+{
+    if ((show == m_staticTextPauses->IsShown()) && (num == m_staticTextPauses->GetLabelText()))
+        return;
+
+    m_staticTextPauses->Show(show);
+    m_staticTextPauses->SetLabelText(num);
+}
+
+void PrintingTaskPanel::updatePauseMarkers(const DevPrintPauseList *pauseList, int printRemainingTime)
+{
+    if (!pauseList || pauseList->m_points.empty()) {
+        m_gauge_progress->ClearMarkers();
+        return;
+    }
+
+    constexpr size_t MAX_VISIBLE_PAUSE_MARKERS = 5;
+    const int printRemainingMinutes = printRemainingTime / 60;
+    std::vector<const DevPrintPausePoint *> upcomingPauses;
+    upcomingPauses.reserve(pauseList->m_points.size());
+    for (const auto &point : pauseList->m_points) {
+        if (point.m_remainingTime >= 0 && point.m_remainingTime <= printRemainingMinutes)
+            upcomingPauses.emplace_back(&point);
+    }
+    std::sort(upcomingPauses.begin(), upcomingPauses.end(), [](const auto *lhs, const auto *rhs) {
+        if (lhs->m_remainingTime != rhs->m_remainingTime)
+            return lhs->m_remainingTime > rhs->m_remainingTime;
+        return lhs->m_pauseIndex < rhs->m_pauseIndex;
+    });
+    if (upcomingPauses.size() > MAX_VISIBLE_PAUSE_MARKERS)
+        upcomingPauses.resize(MAX_VISIBLE_PAUSE_MARKERS);
+
+    std::vector<ProgressBar::Marker> markers;
+    markers.reserve(upcomingPauses.size());
+    for (size_t index = 0; index < upcomingPauses.size(); ++index) {
+        const auto &pausePoint = *upcomingPauses[index];
+        ProgressBar::Marker marker;
+        marker.m_position = pausePoint.m_progressPercent;
+        const int timeUntilPause = printRemainingTime - pausePoint.m_remainingTime * 60;
+        marker.m_label = wxString::Format(
+            "%s (-%s)", _L("Pause"), from_u8(get_bbl_monitor_time_dhm(timeUntilPause)));
+        markers.emplace_back(std::move(marker));
+    }
+    m_gauge_progress->SetMarkers(markers);
 }
 
 void PrintingTaskPanel::show_priting_use_info(bool show, wxString time /*= wxEmptyString*/, wxString weight /*= wxEmptyString*/)
@@ -3030,6 +3109,7 @@ StatusPanel::StatusPanel(wxWindow *parent, wxWindowID id, const wxPoint &pos, co
     Bind(EVT_AMS_REFRESH_RFID, &StatusPanel::on_ams_refresh_rfid, this);
     Bind(EVT_AMS_ON_SELECTED, &StatusPanel::on_ams_selected, this);
     Bind(EVT_AMS_ON_FILAMENT_EDIT, &StatusPanel::on_filament_edit, this);
+    Bind(EVT_AMS_NEW_FILAMENT_HINT, &StatusPanel::on_new_official_filament_hint, this);
     Bind(EVT_VAMS_ON_FILAMENT_EDIT, &StatusPanel::on_ext_spool_edit, this);
     // Bind(EVT_VAMS_ON_FILAMENT_EDIT, &StatusPanel::on_filament_edit, this);
     Bind(EVT_AMS_GUIDE_WIKI, &StatusPanel::on_ams_guide, this);
@@ -3254,7 +3334,19 @@ void StatusPanel::on_subtask_abort(wxCommandEvent &event)
     abort_dlg->Raise();
 }
 
-void StatusPanel::error_info_reset() { m_project_task_panel->error_info_reset(); }
+void StatusPanel::error_info_reset()
+{
+    if (m_project_task_panel->error_info_reset()) {
+        refreshProjectTaskLayout();
+    }
+}
+
+void StatusPanel::refreshProjectTaskLayout()
+{
+    Layout();
+    FitInside();
+    m_project_task_panel->Refresh();
+}
 
 void StatusPanel::on_print_error_clean(wxCommandEvent &event)
 {
@@ -3482,7 +3574,10 @@ void StatusPanel::update_error_message()
         BOOST_LOG_TRIVIAL(info) << "print error: device error code = " << obj->print_error;
 
         /* show error message on task panel */
-        if (!error_msg.IsEmpty()) { m_project_task_panel->show_error_msg(error_msg); }
+        if (!error_msg.IsEmpty()) {
+            m_project_task_panel->show_error_msg(error_msg);
+            refreshProjectTaskLayout();
+        }
     }
 
     last_error = obj->print_error;
@@ -4178,6 +4273,9 @@ void StatusPanel::update_subtask(MachineObject *obj)
                     image = image.Scale(width, height, wxIMAGE_QUALITY_NORMAL);
                     return wxBitmap(image);
                 };
+                auto get_resource_image_path = [](const std::string &image_name) {
+                    return from_u8((boost::format("%1%/images/%2%.png") % resources_dir() % image_name).str());
+                };
                 wxString png_path = "";
                 int      width    = m_project_task_panel->get_bitmap_thumbnail()->GetSize().x;
                 int      height   = m_project_task_panel->get_bitmap_thumbnail()->GetSize().y;
@@ -4192,17 +4290,17 @@ void StatusPanel::update_subtask(MachineObject *obj)
                                 image_name += "_left";
                             }
                         }
-                        png_path = (boost::format("%1%/images/%2%.png") % resources_dir() % image_name).str();
+                        png_path = get_resource_image_path(image_name);
                     } else if (m_calib_mode == CalibMode::Calib_Flow_Rate) {
-                        png_path = (boost::format("%1%/images/flow_rate_calibration_auto.png") % resources_dir()).str();
+                        png_path = get_resource_image_path("flow_rate_calibration_auto");
                     }
 
                 } else if (m_calib_method == CALI_METHOD_MANUAL) {
                     if (m_calib_mode == CalibMode::Calib_PA_Line) {
                         if (cali_stage == 0) { // Line mode
-                            png_path = (boost::format("%1%/images/fd_calibration_manual.png") % resources_dir()).str();
+                            png_path = get_resource_image_path("fd_calibration_manual");
                         } else if (cali_stage == 1) { // Pattern mode
-                            png_path = (boost::format("%1%/images/fd_pattern_manual_device.png") % resources_dir()).str();
+                            png_path = get_resource_image_path("fd_pattern_manual_device");
                         }
                     }
                 }
@@ -4216,6 +4314,15 @@ void StatusPanel::update_subtask(MachineObject *obj)
     }
 
     m_project_task_panel->show_layers_num(obj->is_support_layer_num);
+    const auto &pauseList = obj->getPrintTaskInfo().getPauseList();
+    if (pauseList && pauseList->m_total > 0) {
+        m_project_task_panel->updatePauseNum(
+            true, _L("Pause") + wxString::Format(": %d/%d", pauseList->getPassedCount(), pauseList->m_total));
+        m_project_task_panel->updatePauseMarkers(&*pauseList, obj->mc_left_time);
+    } else {
+        m_project_task_panel->updatePauseNum(false);
+        m_project_task_panel->updatePauseMarkers(nullptr);
+    }
 
     update_model_info();
     update_partskip_button(obj);
@@ -4467,6 +4574,8 @@ void StatusPanel::reset_printing_values()
     m_project_task_panel->update_left_time(NA_STR);
     m_project_task_panel->update_finish_time(NA_STR);
     m_project_task_panel->update_layers_num(true, wxString::Format(_L("Layer: %s"), NA_STR));
+    m_project_task_panel->updatePauseNum(false);
+    m_project_task_panel->updatePauseMarkers(nullptr);
     update_calib_bitmap();
     m_current_print_mode = PrintingTaskType::PRINGINT;
 
@@ -5071,6 +5180,112 @@ void StatusPanel::on_filament_edit(wxCommandEvent &event)
             ;
         }
     }
+}
+
+static nlohmann::json build_ams_tray_batch_create(DevAmsTray* tray,
+                                                   const std::string& ams_id,
+                                                   MachineObject* obj)
+{
+    nlohmann::json spool = nlohmann::json::object();
+    // Mirror normalize_ams_rfid_for_web: official BBL RFID uses uuid
+    if (tray->tag_uid.size() == 16 && tray->tag_uid.substr(12, 2) == "01")
+        spool["tag_uid"] = tray->uuid;
+    spool["setting_id"]    = tray->setting_id;
+    spool["tray_id_name"]  = tray->tray_id_name;
+    std::string color = tray->color;
+    if (!color.empty() && color[0] != '#') color = "#" + color;
+    spool["color_code"]    = color;
+    if (!tray->cols.empty()) spool["colors"] = tray->cols;
+    spool["color_type"]    = static_cast<int>(tray->ctype);
+    spool["material_type"] = tray->m_fila_type;
+    // tray->sub_brands holds the SERIES name (e.g. "PLA Silk"), not the brand.
+    // Resolve the actual vendor name from the preset bundle via filament_id.
+    {
+        std::string brand;
+        if (!tray->setting_id.empty()) {
+            if (auto* bundle = wxGetApp().preset_bundle) {
+                auto info = bundle->get_filament_by_filament_id(tray->setting_id);
+                if (info.has_value())
+                    brand = info->vendor;
+            }
+        }
+        spool["brand"]  = brand;
+        spool["series"] = tray->sub_brands;
+    }
+    spool["entry_method"]  = "ams_sync";
+    spool["bound_dev_id"]  = obj->get_dev_id();
+    spool["bound_ams_id"]  = ams_id;
+    if (!tray->diameter.empty()) {
+        try { spool["diameter"] = std::stof(tray->diameter); } catch (...) {}
+    }
+    if (!tray->weight.empty()) {
+        try { spool["initial_weight"] = std::stod(tray->weight); } catch (...) {}
+    }
+    nlohmann::json body;
+    body["module"]  = "filament";
+    body["submod"]  = "spool";
+    body["action"]  = "batch_create";
+    body["payload"] = {{"creates", nlohmann::json::array({spool})},
+                       {"updates", nlohmann::json::array()}};
+    return body;
+}
+
+void StatusPanel::on_new_official_filament_hint(wxCommandEvent &event)
+{
+    std::string ams_id  = std::to_string(event.GetInt());
+    std::string slot_id = event.GetString().ToStdString();
+
+    if (!m_new_official_filament_dlg)
+        m_new_official_filament_dlg = new AMSNewOfficialFilamentDlg(this);
+    m_new_official_filament_dlg->SetTrayContext(obj, ams_id, slot_id);
+
+    int rc = m_new_official_filament_dlg->ShowModal();
+    if (rc == wxID_OK) {
+        m_ams_control->dismiss_filament_hint(ams_id, slot_id);
+        auto choice = m_new_official_filament_dlg->GetChoice();
+        if (choice == AMSNewOfficialFilamentDlg::Choice::Skip) {
+            DevAmsTray* tray = obj ? obj->get_ams_tray(ams_id, slot_id) : nullptr;
+            if (tray && !tray->uuid.empty()) {
+                if (auto* sync = wxGetApp().fila_manager_sync())
+                    sync->skip_new_filament_hint(tray->uuid);
+            }
+        }
+        if (choice == AMSNewOfficialFilamentDlg::Choice::RecordNew ||
+            choice == AMSNewOfficialFilamentDlg::Choice::LinkExisting) {
+
+            auto* mf = wxGetApp().mainframe;
+            if (mf && mf->web_device() && obj) {
+                DevAmsTray* tray = obj->get_ams_tray(ams_id, slot_id);
+                if (tray) {
+                    if (choice == AMSNewOfficialFilamentDlg::Choice::RecordNew) {
+                        mf->web_device()->DispatchCommand(
+                            build_ams_tray_batch_create(tray, ams_id, obj));
+                    } else {
+                        const std::string old_id =
+                            m_new_official_filament_dlg->GetSelectedLinkSpoolId();
+                        if (!old_id.empty()) {
+                            // Delete the old no-RFID spool
+                            nlohmann::json del_body;
+                            del_body["module"]  = "filament";
+                            del_body["submod"]  = "spool";
+                            del_body["action"]  = "remove";
+                            del_body["payload"] = {{"spool_id", old_id}};
+                            mf->web_device()->DispatchCommand(del_body);
+                            // Re-add with RFID from AMS tray
+                            mf->web_device()->DispatchCommand(
+                                build_ams_tray_batch_create(tray, ams_id, obj));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void StatusPanel::set_ams_new_filament_hint(const std::string& ams_id, const std::string& slot_id, bool show)
+{
+    if (m_ams_control)
+        m_ams_control->set_new_filament_hint(ams_id, slot_id, show);
 }
 
 void StatusPanel::on_ext_spool_edit(wxCommandEvent &event)
@@ -6236,7 +6451,7 @@ wxBoxSizer *ScoreDialog::get_photo_btn_sizer()
 
     m_add_photo->Bind(wxEVT_LEFT_DOWN, [this](auto &e) {
         // add photo logic
-        wxFileDialog openFileDialog(this, "Select Images", "", "", "Image files (*.png;*.jpg;*jpeg)|*.png;*.jpg;*.jpeg", wxFD_OPEN | wxFD_FILE_MUST_EXIST | wxFD_MULTIPLE);
+        wxFileDialog openFileDialog(this, "Select Images", from_u8(wxGetApp().app_config->get_last_dir()), "", "Image files (*.png;*.jpg;*jpeg)|*.png;*.jpg;*.jpeg", wxFD_OPEN | wxFD_FILE_MUST_EXIST | wxFD_MULTIPLE);
 
         if (openFileDialog.ShowModal() == wxID_CANCEL) return;
 

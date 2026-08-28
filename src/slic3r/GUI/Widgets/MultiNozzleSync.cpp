@@ -3,6 +3,7 @@
 #include "../DeviceCore/DevConfigUtil.h"
 #include "../DeviceCore/DevManager.h"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/LocalesUtils.hpp"
 #include <wx/sizer.h>
 
 
@@ -377,7 +378,7 @@ std::vector<int> HotEndTable::FilterHotEnds(const NozzleOption& option)
 
     for (auto& info : nozzles_to_search) {
 
-        float diameter = atof(info.diameter.c_str());
+        float diameter = string_to_double_decimal_point(info.diameter);
         NozzleFlowType flow = DevNozzle::ToNozzleFlowType(info.volume_type);
         int extruder_id = 1 - info.extruder_id; //physical
 
@@ -1012,20 +1013,20 @@ void MultiNozzleSyncDialog::UpdateButton(std::weak_ptr<DevNozzleRack> rack, bool
         if (m_refresh_timer)
             m_refresh_timer->Start(500);
         nozzle_rack->Bind(DEV_RACK_EVENT_READING_FINISHED, &MultiNozzleSyncDialog::OnRackStatusReadingFinished, this);
-        };
+    };
 
     auto trust_cmd = [rack, this]() {
         auto nozzle_rack = rack.lock();
         if (!nozzle_rack)
             return;
         nozzle_rack->CtrlRackConfirmAll();
-        UpdateUi(rack, true, false);
+        UpdateUi(rack, true, true);
     };
 
     auto ignore_opt = [rack,this]() {
         if (!UpdateUi(rack, true, true))
             EndModal(wxID_OK);
-        };
+    };
 
     m_cancel_btn->Enable();
     m_confirm_btn->Enable();

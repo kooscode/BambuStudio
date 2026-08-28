@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 #include "nlohmann/json.hpp"
+#include "slic3r/Utils/bambu_networking.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -30,6 +31,12 @@ public:
 
     // GET /filament/config  (no auth required)
     void get_filament_config(SuccessFn on_ok, ErrorFn on_err);
+
+    // POST /my/filament/v2/ams/sync
+    void sync_ams(BBL::AmsSyncParams params, SuccessFn on_ok, ErrorFn on_err);
+
+    // POST /my/filament/v2/slot-mappings/sync
+    void sync_slot_mappings(BBL::SlotMappingsSyncParams params, SuccessFn on_ok, ErrorFn on_err);
 
 private:
     bool        check_login(ErrorFn& on_err) const;

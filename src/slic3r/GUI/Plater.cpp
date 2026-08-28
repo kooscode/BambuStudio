@@ -1,13 +1,18 @@
 #include "Plater.hpp"
 #include <array>
+#include <boost/format/format_fwd.hpp>
 #include <cstddef>
 #include <cstdio>
+#include <cctype>
+#include <cmath>
 #include <algorithm>
 #include <map>
 #include <numeric>
 #include <vector>
 #include <string>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <regex>
 #include <optional>
@@ -76,6 +81,8 @@
 #include "libslic3r/LocalesUtils.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "MixedFilamentDialog.hpp"
+#include "ColorDecomposeDialog.hpp"
+#include "ColorDecomposeSupport.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/ClipperUtils.hpp"
@@ -145,6 +152,7 @@
 #include "BitmapCache.hpp"
 #include "ParamsDialog.hpp"
 #include "ImageDPIFrame.hpp"
+#include "FilamentBitmapUtils.hpp"
 #include "Widgets/Label.hpp"
 #include "Widgets/RoundedRectangle.hpp"
 #include "Widgets/RadioBox.hpp"
@@ -212,6 +220,9 @@ static bool has_importable_texture(const Slic3r::TexturedMesh& textured_mesh)
     if (textured_mesh.vertices.empty() || textured_mesh.indices.empty())
         return false;
 
+    if (!textured_mesh.precomputed_face_colors.empty())
+        return true;
+
     return std::any_of(textured_mesh.textures.begin(), textured_mesh.textures.end(),
         [](const Slic3r::TextureImage& texture) { return !texture.data.empty(); });
 }
@@ -259,7 +270,7 @@ wxDEFINE_EVENT(EVT_SWITCH_TO_PREPARE_TAB, wxCommandEvent);
 
 // helio
 wxDEFINE_EVENT(EVT_HELIO_PROCESSING_COMPLETED, HelioCompletionEvent);
-wxDEFINE_EVENT(EVT_HELIO_PROCESSING_STARTED, SimpleEvent);
+wxDEFINE_EVENT(EVT_HELIO_PROCESSING_STARTED, HelioActionEvent);
 wxDEFINE_EVENT(EVT_HELIO_INPUT_DLG, SimpleEvent);
 // end helio
 
@@ -286,6 +297,41 @@ static void set_config_values(DynamicPrintConfig *config, const std::string &key
     else {
         BOOST_LOG_TRIVIAL(info) << "set_config_values: the key" << key << "is empty.";
     }
+}
+
+// Decide whether a loaded 3mf config really belongs to a Bambu Lab machine
+static bool is_bbl_vendor_config(const DynamicPrintConfig &config_loaded, PresetBundle *preset_bundle)
+{
+    if (!preset_bundle) return false;
+    auto *printer_model_opt = config_loaded.option<ConfigOptionString>("printer_model");
+    if (!printer_model_opt || printer_model_opt->value.empty()) return false;
+
+    for (const auto &vendor : preset_bundle->vendors) {
+        for (const auto &vendor_model : vendor.second.models) {
+            if (vendor_model.name == printer_model_opt->value) return vendor.first == "BBL";
+        }
+    }
+    return false;
+}
+
+// Check whether a 3mf's per-extruder options match the nozzle_diameter count.
+// Must run on the raw loaded config, before defaults backfill would mask absent options.
+// Returns true when consistent, false on the first size mismatch.
+static bool check_project_config(const DynamicPrintConfig &config_loaded)
+{
+    auto *nd = config_loaded.option<ConfigOptionFloatsNullable>("nozzle_diameter");
+    if (!nd) return false;
+
+    const size_t extruder_count = nd->size();
+    if (extruder_count <= 1) return true;
+
+    const auto  *opt = dynamic_cast<const ConfigOptionVectorBase *>(config_loaded.option("extruder_type"));
+    const size_t sz  = opt ? opt->size() : 0;
+    if (sz != extruder_count) {
+        BOOST_LOG_TRIVIAL(warning) << "config invalid, extruder_type size expected " << extruder_count << " got " << sz;
+        return false;
+    }
+    return true;
 }
 
 // When saving layer-slider ticks to the model, re-append entries whose print_z is above the current
@@ -352,7 +398,7 @@ static std::map<BedType, std::string> bed_type_thumbnails = {
     {BedType::btPC, "bed_cool"},
     {BedType::btEP, "bed_engineering"},
     {BedType::btPEI, "bed_high_templ"},
-    {BedType::btPTE, "bed_pei"},
+    {BedType::btPTE, "bed_texture"},
     {BedType::btSuperTack, "bed_cool_supertack"}
 };
 
@@ -1230,7 +1276,7 @@ static std::map<int, std::vector<DevNozzle>> deserialize_nozzle_config(const std
             boost::split(values, part, boost::is_any_of(","));
             if (values.size() == 2) {
                 DevNozzle nozzle;
-                nozzle.m_diameter = std::stof(values[0]);
+                nozzle.m_diameter = string_to_double_decimal_point(values[0]);
                 nozzle.m_nozzle_flow = static_cast<NozzleFlowType>(std::stoi(values[1]));
                 nozzles.push_back(nozzle);
             }
@@ -1970,9 +2016,12 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
     nozzle_diameters.resize(extruder_nums);
     std::vector<NozzleVolumeType>target_types(extruder_nums, NozzleVolumeType::nvtStandard);
 
+    // Two extruder id spaces are in play here: "index" is the logical id (0 = left, 1 = right),
+    // which is what nozzle_diameters/target_types and every downstream preset consumer are keyed by,
+    // while physical id is used as a device query argument.
     for (size_t index = 0; index < extruder_nums; ++index) {
-        int extruder_id = extruder_map[index]; //physical extruder id
-        nozzle_diameters[extruder_id] = nozzle_option ? atof(nozzle_option->diameter.c_str()) : obj->GetExtderSystem()->GetNozzleDiameter(index);
+        int physical_extruder_id = extruder_map[index]; // physical extruder id
+        nozzle_diameters[index]  = nozzle_option ? string_to_double_decimal_point(nozzle_option->diameter) : obj->GetExtderSystem()->GetNozzleDiameter(physical_extruder_id);
         std::optional<NozzleVolumeType> select_type;
         NozzleVolumeType target_type = NozzleVolumeType::nvtStandard;
         if (nozzle_option && nozzle_option->extruder_nozzle_stats.count(index)) {
@@ -1983,15 +2032,15 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
         }
 
         if (obj->is_nozzle_flow_type_supported()) {
-            if (obj->GetExtderSystem()->GetNozzleFlowType(index) == NozzleFlowType::NONE_FLOWTYPE) {
+            if (obj->GetExtderSystem()->GetNozzleFlowType(physical_extruder_id) == NozzleFlowType::NONE_FLOWTYPE) {
                 MessageDialog dlg(this->plater, _L("There are unset nozzle types. Please set the nozzle types of all extruders before synchronizing."),
                                   _L("Sync extruder information"), wxICON_WARNING | wxOK);
                 dlg.ShowModal();
                 continue;
             }
             // hack code, only use standard flow for 0.2
-            if (std::fabs(nozzle_diameters[extruder_id] - 0.2) > EPSILON && !is_skip_high_flow_printer(printer_model))
-                target_type = DevNozzle::ToNozzleVolumeType(obj->GetExtderSystem()->GetNozzleFlowType(extruder_id));
+            if (std::fabs(nozzle_diameters[index] - 0.2) > EPSILON && !is_skip_high_flow_printer(printer_model))
+                target_type = DevNozzle::ToNozzleVolumeType(obj->GetExtderSystem()->GetNozzleFlowType(physical_extruder_id));
         }
         if (select_type)
             target_type = *select_type;
@@ -2059,7 +2108,17 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
 
     // set nozzle volume type after switching prset, so this value can override the old value stored in conf
     auto printer_tab = dynamic_cast<TabPrinter *>(wxGetApp().get_tab(Preset::TYPE_PRINTER));
+    auto *nozzle_sys = obj->GetNozzleSystem();
     for (size_t idx = 0; idx < target_types.size(); ++idx) {
+        // When syncing, the connected machine is the source of truth for the nozzle count.
+        // For single-nozzle extruders on_volume_type_switch only carries the previous count
+        // forward and never refreshes it, so read presence straight from the machine here:
+        // 1 if the extruder actually has a nozzle installed, 0 otherwise.
+        if (!support_multi_nozzle && nozzle_sys) {
+            int  physical_extruder_id = extruder_map[idx];
+            bool nozzle_installed     = !nozzle_sys->GetExtNozzle(physical_extruder_id).IsEmpty();
+            preset_bundle->extruder_nozzle_stat.set_extruder_nozzle_count(idx, target_types[idx], int(nozzle_installed), true);
+        }
         printer_tab->set_extruder_volume_type(idx, target_types[idx]);
     }
 
@@ -3538,12 +3597,20 @@ void Sidebar::update_presets(Preset::Type preset_type)
             for (size_t i = 0; i < nozzle_volumes_def->enum_labels.size(); ++i) {
                 if (boost::algorithm::contains(extruder_variants->values[index], type + " " + nozzle_volumes_def->enum_labels[i]) ||
                     extruder_max_nozzle_count->values[index] > 1 && nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == nvtHybrid) {
-                    if (nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == NozzleVolumeType::nvtHighFlow &&(diameter == "0.2" ||
+                    auto cur_volume_type = nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]);
+                    // Defensive: profiles restrict E3D to 0.4 / 0.6; keep it out elsewhere.
+                    if (cur_volume_type == NozzleVolumeType::nvtE3DHighFlow && diameter != "0.4" && diameter != "0.6")
+                        continue;
+                    // 0.2 nozzle has no High Flow variant.
+                    if (cur_volume_type == NozzleVolumeType::nvtHighFlow && (diameter == "0.2" ||
                         is_skip_high_flow_printer(printer_model)))
                         continue;
-                    if (nozzle_volumes->values[index] == i)
+                    // ClientData must be the enum value (e.g. nvtE3DHighFlow=5), not the
+                    // enum_labels index. After nvtE3DHighFlow was pinned to 5 with a gap at 4,
+                    // storing the label index wrote an invalid type and broke variant lookup.
+                    if (nozzle_volumes->values[index] == cur_volume_type)
                         select = extruder.combo_flow->GetCount();
-                    extruder.combo_flow->Append(_L(nozzle_volumes_def->enum_labels[i]), {}, (void*)i);
+                    extruder.combo_flow->Append(_L(nozzle_volumes_def->enum_labels[i]), {}, (void *) (intptr_t) cur_volume_type);
                 }
             }
             if (select == -1)
@@ -3676,8 +3743,15 @@ BedType Sidebar::get_cur_select_bed_type() {
 std::string Sidebar::get_cur_select_bed_image(bool &exist)
 {
     auto select_bed_type   = get_cur_select_bed_type();
-    auto series_suffix_str = m_cur_image_bed_type.empty() ? "" : ("_" + m_cur_image_bed_type);
-    auto image_name        = bed_type_thumbnails[select_bed_type] + series_suffix_str;
+    auto image_name        = bed_type_thumbnails[select_bed_type];
+    // Highest priority: if the current printer model declares a resource-binding
+    auto pm = p->plater->get_curr_printer_model();
+    if (pm && !pm->resource_bind_name.empty()) {
+        image_name             +=  "_" + pm->resource_bind_name;
+    } else {
+        auto series_suffix_str = m_cur_image_bed_type.empty() ? "" : ("_" + m_cur_image_bed_type);
+        image_name += series_suffix_str;
+    }
     auto full_path         = into_u8(Slic3r::GUI::from_u8(Slic3r::var(image_name + ".png")));
     if (boost::filesystem::exists(full_path)) {
         exist = true;
@@ -4079,6 +4153,9 @@ void Sidebar::add_filament() {
     if (p->combos_filament.size() >= size_t(EnforcerBlockerType::ExtruderMax)) return;
     wxColour    new_col        = Plater::get_next_color_for_filament();
     add_custom_filament(new_col);
+    // Reveal the just-added filament: it is appended at the end of the physical
+    // filament list, which may sit below the fold when the scroll area is capped.
+    scroll_filament_area_to_bottom();
 }
 
 void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
@@ -4086,7 +4163,7 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
     if (p->combos_filament.size() <= 1) return;
     wxBusyCursor busy;
     size_t filament_count = p->combos_filament.size() - 1;
-    if (filament_id == size_t(-2)) {
+    if (filament_id == static_cast<size_t>(kSidebarContextMenuFilamentId)) {
         filament_id = p->m_menu_filament_id;
     }
     if (filament_id == size_t(-1)) {
@@ -4126,7 +4203,7 @@ void Sidebar::delete_filament(size_t filament_id, int replace_filament_id) {
 
 void Sidebar::change_filament(size_t from_id, size_t to_id)
 {
-    if (from_id == size_t(-2))
+    if (from_id == static_cast<size_t>(kSidebarContextMenuFilamentId))
         from_id = p->m_menu_filament_id;
     if (from_id == size_t(-1))
         from_id = p->combos_filament.size() - 1;
@@ -4173,7 +4250,7 @@ void Sidebar::edit_filament()
         p->editing_filament = p->m_menu_filament_id; // sync with TabPresetComboxBox's m_filament_idx
 }
 
-void Sidebar::add_custom_filament(wxColour new_col, const std::string& preset_name) {
+void Sidebar::add_custom_filament(wxColour new_col, const std::string& preset_name, bool /*skip_preset_validation*/) {
     if (is_new_project_in_gcode3mf()) { return; }
     if (p->combos_filament.size() >= size_t(EnforcerBlockerType::ExtruderMax)) return;
     if (wxGetApp().preset_bundle->filament_presets.size() >= size_t(EnforcerBlockerType::ExtruderMax)) return;
@@ -4256,6 +4333,22 @@ void Sidebar::add_custom_filament(wxColour new_col, const std::string& preset_na
     wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
     auto_calc_flushing_volumes(insert_pos);
+}
+
+void Sidebar::scroll_filament_area_to_bottom()
+{
+    auto* sw = p->m_physical_scroll_area;
+    if (!sw) return;
+    // Defer until after the pending layout pass so the virtual size reflects the new row.
+    sw->CallAfter([sw]() {
+        int ppu_x = 0, ppu_y = 0;
+        sw->GetScrollPixelsPerUnit(&ppu_x, &ppu_y);
+        if (ppu_y <= 0) return;
+        int virtual_h = sw->GetVirtualSize().GetHeight();
+        int client_h  = sw->GetClientSize().GetHeight();
+        int max_units = std::max(0, (virtual_h - client_h + ppu_y - 1) / ppu_y);
+        sw->Scroll(0, max_units);
+    });
 }
 
 bool Sidebar::is_new_project_in_gcode3mf()
@@ -4873,9 +4966,9 @@ static std::vector<Search::InputInfo> get_search_inputs(ConfigOptionMode mode)
     return ret;
 }
 
-void Sidebar::update_searcher()
+void Sidebar::update_searcher(std::optional<ConfigOptionMode> mode)
 {
-    p->searcher.init(get_search_inputs(m_mode));
+    p->searcher.init(get_search_inputs(mode.value_or(m_mode)));
 }
 
 void Sidebar::update_mode()
@@ -5216,8 +5309,7 @@ void Sidebar::update_mixed_filament_list()
                 grad_panel->Bind(wxEVT_PAINT, [grad_panel, col_from, col_to, mix_num, mc_text](wxPaintEvent&) {
                     wxBufferedPaintDC dc(grad_panel);
                     wxSize sz = grad_panel->GetClientSize();
-                    dc.GradientFillLinear(wxRect(0, 0, sz.GetWidth(), sz.GetHeight()),
-                                          col_from, col_to, wxRIGHT);
+                    fill_gradient_rect_east(dc, wxRect(0, 0, sz.GetWidth(), sz.GetHeight()), col_from, col_to);
                     wxString txt = wxString::Format("%u", mix_num);
                     dc.SetFont(::Label::Body_14);
                     wxSize txt_sz = dc.GetTextExtent(txt);
@@ -5629,14 +5721,37 @@ bool Sidebar::has_broken_mixed_filament(const PartPlate* plate) const
 
 void Sidebar::collect_physical_filament_info(std::vector<std::string>& color_strs,
                                               std::vector<std::string>& names,
-                                              std::vector<std::string>& types)
+                                              std::vector<std::string>& types,
+                                              std::vector<size_t>* config_indices)
 {
+    color_strs.clear();
+    names.clear();
+    types.clear();
+    if (config_indices)
+        config_indices->clear();
+
     size_t num_physical = p->combos_filament.size();
     auto& project_config = wxGetApp().preset_bundle->project_config;
+    auto* is_mixed_opt = project_config.option<ConfigOptionBools>("filament_is_mixed");
+    std::vector<size_t> physical_indices;
+    const size_t total = wxGetApp().preset_bundle->filament_presets.size();
+    physical_indices.reserve(num_physical);
+    for (size_t i = 0; i < total && physical_indices.size() < num_physical; ++i) {
+        if (!is_mixed_opt || i >= is_mixed_opt->values.size() || !is_mixed_opt->values[i])
+            physical_indices.push_back(i);
+    }
+    while (physical_indices.size() < num_physical)
+        physical_indices.push_back(physical_indices.size());
+    if (config_indices)
+        *config_indices = physical_indices;
+
     auto* colours_opt = project_config.option<ConfigOptionStrings>("filament_colour");
     if (colours_opt) {
-        for (size_t i = 0; i < num_physical && i < colours_opt->values.size(); ++i)
-            color_strs.push_back(colours_opt->values[i]);
+        for (size_t i = 0; i < num_physical; ++i) {
+            const size_t cfg_idx = physical_indices[i];
+            if (cfg_idx < colours_opt->values.size())
+                color_strs.push_back(colours_opt->values[cfg_idx]);
+        }
     }
 
     for (size_t i = 0; i < num_physical; ++i) {
@@ -5646,13 +5761,14 @@ void Sidebar::collect_physical_filament_info(std::vector<std::string>& color_str
 
     auto& preset_bundle = *wxGetApp().preset_bundle;
     for (size_t i = 0; i < num_physical; ++i) {
+        const size_t cfg_idx = physical_indices[i];
+        Preset* preset = nullptr;
+        if (cfg_idx < preset_bundle.filament_presets.size())
+            preset = preset_bundle.filaments.find_preset(preset_bundle.filament_presets[cfg_idx]);
         std::string ft;
-        if (i < preset_bundle.filament_presets.size()) {
-            auto* preset = preset_bundle.filaments.find_preset(preset_bundle.filament_presets[i]);
-            if (preset) {
-                std::string display_type;
-                ft = preset->config.get_filament_type(display_type);
-            }
+        if (preset) {
+            std::string display_type;
+            ft = preset->config.get_filament_type(display_type);
         }
         if (ft.empty()) ft = "PLA";
         types.push_back(ft);
@@ -5693,6 +5809,111 @@ static std::string serialize_mixed_gradient_curve_if_custom(const MixedFilamentR
     return Slic3r::serialize_gradient_curve(gc);
 }
 
+static bool create_mixed_filament_from_result(
+    Sidebar* sidebar,
+    const MixedFilamentResult& result,
+    const std::vector<std::string>& color_strs)
+{
+    if (!sidebar || result.components.size() < 2 || result.ratios.size() < 2)
+        return false;
+    if (!dynamic_cast<Plater*>(sidebar->GetParent()))
+        return false;
+
+    size_t num_physical = sidebar->combos_filament().size();
+    if (num_physical < 2)
+        return false;
+    if (wxGetApp().preset_bundle->filament_presets.size() >= size_t(EnforcerBlockerType::ExtruderMax))
+        return false;
+
+    auto& project_config = wxGetApp().preset_bundle->project_config;
+    size_t total = wxGetApp().preset_bundle->filament_presets.size();
+    size_t new_idx = total;
+
+    std::string mixed_color = blend_mixed_color(result.components, result.ratios, color_strs);
+    wxGetApp().preset_bundle->set_num_filaments(total + 1, mixed_color);
+
+    auto* multi_colour_opt = project_config.option<ConfigOptionStrings>("filament_multi_colour");
+    if (multi_colour_opt) {
+        while (multi_colour_opt->values.size() <= new_idx) multi_colour_opt->values.push_back("");
+        multi_colour_opt->values[new_idx] = mixed_color;
+    }
+
+    project_config.option<ConfigOptionBools>("filament_is_mixed")->values[new_idx] = true;
+
+    std::string comp_str;
+    for (size_t i = 0; i < result.components.size(); ++i) {
+        if (i > 0) comp_str += ",";
+        comp_str += std::to_string(result.components[i]);
+    }
+    project_config.option<ConfigOptionStrings>("filament_mixed_components")->values[new_idx] = comp_str;
+
+    int ratio_sum = 0;
+    for (int r : result.ratios) ratio_sum += r;
+    if (ratio_sum <= 0) ratio_sum = 100;
+
+    std::string ratio_str;
+    {
+        CNumericLocalesSetter c_locale_setter;
+        for (size_t i = 0; i < result.ratios.size(); ++i) {
+            if (i > 0) ratio_str += ",";
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.4f", (float)result.ratios[i] / ratio_sum);
+            ratio_str += buf;
+        }
+    }
+    project_config.option<ConfigOptionStrings>("filament_mixed_sublayer_ratios")->values[new_idx] = ratio_str;
+
+    if (!project_config.option("filament_mixed_gradient"))
+        project_config.set_key_value("filament_mixed_gradient", new ConfigOptionBools({false}));
+    if (!project_config.option("filament_mixed_gradient_range"))
+        project_config.set_key_value("filament_mixed_gradient_range", new ConfigOptionStrings({""}) );
+    if (!project_config.option("filament_mixed_gradient_curve"))
+        project_config.set_key_value("filament_mixed_gradient_curve", new ConfigOptionStrings({""}) );
+    if (!project_config.option("filament_mixed_gradient_per_part"))
+        project_config.set_key_value("filament_mixed_gradient_per_part", new ConfigOptionBools({false}));
+
+    {
+        auto* grad_opt = project_config.option<ConfigOptionBools>("filament_mixed_gradient");
+        while (grad_opt->values.size() <= new_idx) grad_opt->values.push_back(false);
+        grad_opt->values[new_idx] = result.gradient_enabled;
+    }
+    {
+        auto* grad_range_opt = project_config.option<ConfigOptionStrings>("filament_mixed_gradient_range");
+        while (grad_range_opt->values.size() <= new_idx) grad_range_opt->values.push_back("");
+        if (result.gradient_enabled && result.components.size() == 2) {
+            const char* fmt = (result.gradient_direction == 0) ? "0.9000,0.1000" : "0.1000,0.9000";
+            grad_range_opt->values[new_idx] = fmt;
+        } else {
+            grad_range_opt->values[new_idx] = "";
+        }
+    }
+    {
+        auto* grad_curve_opt = project_config.option<ConfigOptionStrings>("filament_mixed_gradient_curve");
+        while (grad_curve_opt->values.size() <= new_idx) grad_curve_opt->values.push_back("");
+        grad_curve_opt->values[new_idx] = serialize_mixed_gradient_curve_if_custom(result);
+    }
+    {
+        auto* per_part_opt = project_config.option<ConfigOptionBools>("filament_mixed_gradient_per_part");
+        while (per_part_opt->values.size() <= new_idx) per_part_opt->values.push_back(false);
+        per_part_opt->values[new_idx] = result.gradient_enabled && result.per_part_gradient;
+    }
+
+    auto& presets = wxGetApp().preset_bundle->filament_presets;
+    if (result.components[0] >= 1 && result.components[0] <= num_physical && presets.size() > new_idx)
+        presets[new_idx] = presets[result.components[0] - 1];
+
+    size_t filament_count = wxGetApp().preset_bundle->filament_presets.size();
+    wxGetApp().plater()->get_partplate_list().on_filament_added(filament_count);
+    wxGetApp().plater()->on_filament_count_change(filament_count);
+    wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
+    wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
+
+    sidebar->update_mixed_filament_list();
+    wxGetApp().plater()->update_project_dirty_from_presets();
+    wxPostEvent(sidebar, SimpleEvent(EVT_SCHEDULE_BACKGROUND_PROCESS, sidebar));
+    return true;
+}
+
 void Sidebar::add_mixed_filament()
 {
     auto* plater = dynamic_cast<Plater*>(GetParent());
@@ -5705,102 +5926,10 @@ void Sidebar::add_mixed_filament()
     std::vector<std::string> color_strs, names, types;
     collect_physical_filament_info(color_strs, names, types);
 
-    auto& project_config = wxGetApp().preset_bundle->project_config;
-
     MixedFilamentDialog dlg(this, color_strs, names, types);
     if (dlg.ShowModal() == wxID_OK) {
         auto result = dlg.get_result();
-        if (result.components.size() < 2 || result.ratios.size() < 2) return;
-
-        size_t total = wxGetApp().preset_bundle->filament_presets.size();
-        size_t new_idx = total;
-
-        // Compute blended color from all components
-        std::string mixed_color = blend_mixed_color(result.components, result.ratios, color_strs);
-
-        wxGetApp().preset_bundle->set_num_filaments(total + 1, mixed_color);
-
-        // Update filament_multi_colour for the mixed slot so object list icons reflect the blended color
-        auto* multi_colour_opt = project_config.option<ConfigOptionStrings>("filament_multi_colour");
-        if (multi_colour_opt) {
-            while (multi_colour_opt->values.size() <= new_idx) multi_colour_opt->values.push_back("");
-            multi_colour_opt->values[new_idx] = mixed_color;
-        }
-
-        project_config.option<ConfigOptionBools>("filament_is_mixed")->values[new_idx] = true;
-
-        // Serialize components: "1,2" or "1,2,3"
-        std::string comp_str;
-        for (size_t i = 0; i < result.components.size(); ++i) {
-            if (i > 0) comp_str += ",";
-            comp_str += std::to_string(result.components[i]);
-        }
-        project_config.option<ConfigOptionStrings>("filament_mixed_components")->values[new_idx] = comp_str;
-
-        // Serialize ratios as normalized floats: "0.5000,0.5000" or "0.3000,0.3000,0.4000"
-        int ratio_sum = 0;
-        for (int r : result.ratios) ratio_sum += r;
-        if (ratio_sum <= 0) ratio_sum = 100;
-
-        std::string ratio_str;
-        {
-            CNumericLocalesSetter c_locale_setter;
-            for (size_t i = 0; i < result.ratios.size(); ++i) {
-                if (i > 0) ratio_str += ",";
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%.4f", (float)result.ratios[i] / ratio_sum);
-                ratio_str += buf;
-            }
-        }
-        project_config.option<ConfigOptionStrings>("filament_mixed_sublayer_ratios")->values[new_idx] = ratio_str;
-
-        // Gradient settings — ensure keys exist in dynamic config
-        if (!project_config.option("filament_mixed_gradient"))
-            project_config.set_key_value("filament_mixed_gradient", new ConfigOptionBools({false}));
-        if (!project_config.option("filament_mixed_gradient_range"))
-            project_config.set_key_value("filament_mixed_gradient_range", new ConfigOptionStrings({""}) );
-        if (!project_config.option("filament_mixed_gradient_curve"))
-            project_config.set_key_value("filament_mixed_gradient_curve", new ConfigOptionStrings({""}) );
-        if (!project_config.option("filament_mixed_gradient_per_part"))
-            project_config.set_key_value("filament_mixed_gradient_per_part", new ConfigOptionBools({false}));
-
-        {
-            auto* grad_opt = project_config.option<ConfigOptionBools>("filament_mixed_gradient");
-            while (grad_opt->values.size() <= new_idx) grad_opt->values.push_back(false);
-            grad_opt->values[new_idx] = result.gradient_enabled;
-        }
-        {
-            auto* grad_range_opt = project_config.option<ConfigOptionStrings>("filament_mixed_gradient_range");
-            while (grad_range_opt->values.size() <= new_idx) grad_range_opt->values.push_back("");
-            if (result.gradient_enabled && result.components.size() == 2) {
-                const char* fmt = (result.gradient_direction == 0) ? "0.9000,0.1000" : "0.1000,0.9000";
-                grad_range_opt->values[new_idx] = fmt;
-            } else {
-                grad_range_opt->values[new_idx] = "";
-            }
-        }
-        {
-            auto* grad_curve_opt = project_config.option<ConfigOptionStrings>("filament_mixed_gradient_curve");
-            while (grad_curve_opt->values.size() <= new_idx) grad_curve_opt->values.push_back("");
-            grad_curve_opt->values[new_idx] = serialize_mixed_gradient_curve_if_custom(result);
-        }
-        {
-            auto* per_part_opt = project_config.option<ConfigOptionBools>("filament_mixed_gradient_per_part");
-            while (per_part_opt->values.size() <= new_idx) per_part_opt->values.push_back(false);
-            per_part_opt->values[new_idx] = result.gradient_enabled && result.per_part_gradient;
-        }
-
-        auto& presets = wxGetApp().preset_bundle->filament_presets;
-        if (result.components[0] >= 1 && result.components[0] <= num_physical && presets.size() > new_idx)
-            presets[new_idx] = presets[result.components[0] - 1];
-
-        size_t filament_count = wxGetApp().preset_bundle->filament_presets.size();
-        wxGetApp().plater()->get_partplate_list().on_filament_added(filament_count);
-        wxGetApp().plater()->on_filament_count_change(filament_count);
-        wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
-        wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
-
-        update_mixed_filament_list();
+        create_mixed_filament_from_result(this, result, color_strs);
     }
 }
 
@@ -5969,6 +6098,83 @@ void Sidebar::delete_mixed_filament_at(size_t panel_idx)
     size_t cfg_idx = mixed_indices[panel_idx];
 
     delete_filament(cfg_idx, -1);
+}
+
+void Sidebar::decompose_filament_color(int filament_idx)
+{
+    if (filament_idx == kSidebarContextMenuFilamentId)
+        filament_idx = p->m_menu_filament_id;
+    if (filament_idx < 0)
+        return;
+
+    auto& project_config = wxGetApp().preset_bundle->project_config;
+    auto* colours_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+    if (!colours_opt || static_cast<size_t>(filament_idx) >= colours_opt->values.size())
+        return;
+
+    wxColour target_color(colours_opt->values[filament_idx]);
+
+    std::vector<std::string> color_strs, names, types;
+    std::vector<size_t> physical_config_indices;
+    collect_physical_filament_info(color_strs, names, types, &physical_config_indices);
+
+    // Build decompose-specific types: ColorDecomposeDialog needs "PLA Basic"
+    // distinction (for CMYW/RYBW card visibility), while collect_physical_filament_info
+    // now returns coarse filament_type (e.g. "PLA" for all PLA variants).
+    std::vector<std::string> decompose_types;
+    {
+        auto& pb = *wxGetApp().preset_bundle;
+        for (size_t i = 0; i < physical_config_indices.size(); ++i) {
+            const size_t ci = physical_config_indices[i];
+            Preset* pr = (ci < pb.filament_presets.size())
+                ? pb.filaments.find_preset(pb.filament_presets[ci]) : nullptr;
+            decompose_types.push_back(filament_type_for_color_decompose(pr));
+        }
+    }
+
+    size_t source_physical_idx = size_t(-1);
+    for (size_t i = 0; i < physical_config_indices.size(); ++i) {
+        if (physical_config_indices[i] == static_cast<size_t>(filament_idx)) {
+            source_physical_idx = i;
+            break;
+        }
+    }
+
+    ColorDecomposeDialog dlg(this,
+                             source_physical_idx == size_t(-1) ? -1 : static_cast<int>(source_physical_idx),
+                             target_color, color_strs, names, decompose_types,
+                             wxGetApp().preset_bundle->filament_presets.size(),
+                             static_cast<size_t>(EnforcerBlockerType::ExtruderMax),
+                             physical_config_indices);
+    int modal_res = dlg.ShowModal();
+    if (modal_res == wxID_OK) {
+        ColorDecomposeResult dialog_result = dlg.get_result();
+        MixedFilamentResult mixed_result;
+        std::vector<DecomposeMissingComponent> missing_components;
+        if (!prepare_decompose_mixed_result(dialog_result, static_cast<size_t>(filament_idx), source_physical_idx,
+                                            color_strs, decompose_types, physical_config_indices, mixed_result, missing_components))
+            return;
+
+        if (!confirm_create_decompose_missing_components(this, missing_components))
+            return;
+
+        for (const DecomposeMissingComponent& missing : missing_components) {
+            size_t before_count = p->combos_filament.size();
+            add_custom_filament(wxColour(missing.official_component.color_hex), missing.preset_name, true);
+            size_t after_count = p->combos_filament.size();
+            if (after_count <= before_count)
+                return;
+            set_created_standard_component_metadata(before_count, missing.official_component);
+            if (missing.component_idx < mixed_result.components.size())
+                mixed_result.components[missing.component_idx] = static_cast<unsigned int>(before_count + 1);
+        }
+
+        if (!missing_components.empty()) {
+            collect_physical_filament_info(color_strs, names, types, &physical_config_indices);
+        }
+
+        create_mixed_filament_from_result(this, mixed_result, color_strs);
+    }
 }
 
 // ---- End Mixed Filament sidebar methods ----
@@ -6563,6 +6769,8 @@ public:
         std::vector<Slic3r::FilamentMatch> matches;
         std::vector<std::array<float, 4>>  new_filament_colors;
         std::vector<std::string>           new_filament_preset_names;
+        std::vector<TextureNewMixedFilament> new_mixed_filaments;
+        std::vector<TextureFilamentEntry>  filament_entries;
         size_t                             existing_filament_count = 0;
         bool                               skipped = false;
         bool                               fallback_to_geometry_only = false;
@@ -6618,8 +6826,11 @@ public:
     void align_selection_z_min();
     void align_selection_z_center();
     void mirror(Axis axis);
-    void split_object();
-    void split_volume();
+    void split_object(ModelObject *mo = nullptr, bool ignore_warning = false);
+    void split_volume(bool ignore_warning = false);
+    // While set, prepare-side object removals are treated as internal restructuring (split / merge) and
+    // are NOT propagated as deletes to the independent assembly model (m_assemble_model).
+    void set_suppress_assemble_delete_propagation(bool suppress) { m_suppress_assemble_delete_propagation = suppress; }
     void scale_selection_to_fit_print_volume();
 
     // Return the active Undo/Redo stack. It may be either the main stack or the Gimzo stack.
@@ -6627,6 +6838,77 @@ public:
     Slic3r::UndoRedo::Stack& undo_redo_stack_main() { return m_undo_redo_stack_main; }
     void enter_gizmos_stack();
     bool leave_gizmos_stack();
+    // Derive the persistent independent assembly model from the prepare model (shared meshes, GUIDs copied).
+    void derive_assemble_model();
+    // Project reset / load_project: drop assemble objects, undo, and assembly artifacts on both models.
+    void invalidate_assemble_model_on_project_reset();
+    // True when the live m_assemble_model is stale relative to prepare (e.g. emptied by
+    // propagate_delete_to_assemble after a prepare delete, while prepare undo restored objects /
+    // assembly_model.json). Next assembly enter must re-derive instead of append+set_assembly_pos.
+    bool assemble_model_needs_rederive_from_prepare() const;
+    // On entering the assembly view: append prepare-side objects not yet referenced (by part_guid) in a_model.
+    void sync_assemble_model_on_enter(const std::vector<size_t>& loaded_idxs = {});
+    // Mirror the render-relevant per-part state (filament / MMU color painting) between the prepare model
+    bool sync_assemble_render_state(bool prepare_to_assemble);
+    // Prepare-side delete event: remove a_model objects that reference the about-to-be-deleted object's parts.
+    void propagate_delete_to_assemble(const ModelObject &prepare_object);
+    // Prepare-side per-volume delete event: remove the single assembly volume referencing the deleted
+    // part (by part_guid), leaving the rest of its assembly object intact. Must be called BEFORE the
+    // prepare volume is destroyed. Event-driven on purpose: a volume-split also makes the original GUID
+    // vanish, so a diff on assembly-view entry could not tell delete from split; suppression during
+    // split/combine (m_suppress_assemble_delete_propagation) keeps those structural ops from propagating.
+    void propagate_volume_delete_to_assemble(const ModelVolume &prepare_volume);
+    // Propagate a prepare-side ModelVolume rename to the matching assembly model volume
+    // (matched by part_guid / assembly_src_guid). Called from ObjectList so the assembly
+    // view sees the current name immediately.
+    void sync_assemble_volume_name(const std::string &part_guid, const std::string &new_name);
+    // Change filament for the assembly-canvas selection, operating on m_assemble_model directly.
+    void change_extruder_for_assemble_selection(int extruder);
+    // On assembly-view entry: re-share prepare-side meshes whose shared_ptr changed (e.g. Simplify),
+    // matched by assembly_src_guid. Split / combined parts (GUID gone) keep their frozen mesh.
+    void sync_assemble_mesh_from_prepare();
+    // On assembly-view entry: reproduce each prepare part's world size (instance_scale ⊙ volume_scale,
+    // covering both object-level and part-level prepare scaling) on its assembly counterpart (matched by
+    // assembly_src_guid) by baking it into the assembly volume's assemble scale and dividing out the
+    // assembly instance scale. When the prepare side uniformly rescales a whole model -- or a whole
+    // prepare object (e.g. a STEP multipart while a neighbouring cube is left alone) -- assembly poses
+    // are also scaled about a ground-level pivot so the parts do not fall apart. The assembly view has
+    // no scale tool, so size is always prepare-authoritative (one-way sync).
+    void sync_assemble_scale_from_prepare();
+    // Safety net run at the end of sync_assemble_model_on_enter: drop assembly volumes whose
+    // assembly_src_guid no longer matches any prepare part (a prepare-side delete that did not propagate,
+    // or an inconsistent restored state), then drop any assembly object left with no volumes. Pruned
+    // volumes / objects are logged by name. Prepare-side split/combine keep GUIDs, so they are never pruned.
+    void prune_orphan_assemble_parts();
+    // Pull prepare-side ModelObject / ModelInstance printable onto matching assembly ModelVolumes
+    // (matched by assembly_src_guid -> prepare part_guid). On the assembly side, printable is
+    // ModelVolume-only: this never leaves a meaningful assembly ModelObject / ModelInstance
+    // printable (forced true on sync) so a multipart assembly MO can grey individual parts.
+    // Re-enter must refresh this.
+    void sync_assemble_printable_from_prepare();
+    // Mirror the assembly steps / tree authored on m_assemble_model back onto the prepare model so the
+    // existing 3mf export path (which serializes from the prepare model) persists assembly-view edits.
+    void sync_assemble_steps_to_main_model();
+    // Assembly view independent Undo/Redo stack (mirrors the gizmos-stack switching pattern).
+    void enter_assemble_stack();
+    bool leave_assemble_stack();
+    // Slim Undo/Redo path used only while the assembly stack is active: restores m_assemble_model and
+    // reloads the assembly scene, deliberately skipping the prepare-model project machinery in undo_redo_to().
+    void assemble_undo_redo_to(std::vector<UndoRedo::Snapshot>::const_iterator it_snapshot);
+    // Assembly guide UI cursor history, keyed by assemble-stack snapshot timestamps.
+    // Kept out of UndoRedo::SnapshotData so the undo core stays domain-agnostic.
+    struct AssemblyGuideUiSnapshot {
+        // Stable AssemblyStepsTreeNode::id of the selected step folder. Node indices
+        // cannot be used here: undo/redo rebuilds the whole node vector from JSON in
+        // traversal order, while runtime edits append, so the same step changes index.
+        // -1 means overall-preview / no step editing.
+        int selected_folder_id{-1};
+        int keyframe_selected{-1};
+    };
+    void remember_assemble_guide_ui(size_t snapshot_timestamp);
+    void remember_assemble_guide_ui_for_latest_action_snapshot();
+    void prune_assemble_guide_ui_snapshots();
+    void clear_assemble_guide_ui_snapshots() { m_assemble_guide_ui_by_time.clear(); }
 
     void take_snapshot(const std::string& snapshot_name, UndoRedo::SnapshotType snapshot_type = UndoRedo::SnapshotType::Action);
     /*void take_snapshot(const wxString& snapshot_name, UndoRedo::SnapshotType snapshot_type = UndoRedo::SnapshotType::Action)
@@ -6718,10 +7000,14 @@ public:
 
     // V2: single material path (feature flag OFF)
     int update_helio_background_process_v2(std::string& printer_id, std::string& material_id);
+    int update_helio_background_process_v2_once(std::string& printer_id, std::string& material_id);
     // V3: multi-material path (feature flag ON)
     int update_helio_background_process(std::string& printer_id,
                                          std::vector<HelioQuery::MaterialInput>& materials,
                                          bool& is_multi_color, bool& is_multi_material);
+    int update_helio_background_process_once(std::string& printer_id,
+                                              std::vector<HelioQuery::MaterialInput>& materials,
+                                              bool& is_multi_color, bool& is_multi_material);
 
     void clear_warnings();
     void add_warning(const Slic3r::PrintStateBase::Warning &warning, size_t oid);
@@ -6769,9 +7055,9 @@ public:
     void on_action_slice_plate(SimpleEvent&);
     void on_action_slice_all(SimpleEvent&);
     void on_helio_processing_complete(HelioCompletionEvent &);
-    void on_helio_processing_start(SimpleEvent &);
+    void on_helio_processing_start(HelioActionEvent &);
     void on_helio_input_dlg(SimpleEvent &);
-    void on_helio_process();
+    void on_helio_process(const PartPlate* expected_plate);
     void on_action_publish(wxCommandEvent &evt);
     void on_action_print_plate(SimpleEvent&);
     void on_action_print_all(SimpleEvent&);
@@ -6838,7 +7124,7 @@ public:
     //BBS: add plate_id for thumbnail
     void generate_thumbnail(ThumbnailData& data, unsigned int w, unsigned int h, const ThumbnailsParams& thumbnail_params,
                                       Camera::EType           camera_type,
-                                      Camera::ViewAngleType   camera_view_angle_type = Camera::ViewAngleType::Iso,
+                                      Camera::ViewAngleType   camera_view_angle_type = Camera::ViewAngleType::Iso_3,
                                       bool                    for_picking            = false,
                                       bool                    ban_light              = false);
     ThumbnailsList generate_thumbnails(const ThumbnailsParams& params, Camera::EType camera_type);
@@ -6886,6 +7172,7 @@ public:
     void on_action_send_to_multi_app(SimpleEvent&);
     int update_print_required_data(Slic3r::DynamicPrintConfig config, Slic3r::Model model, Slic3r::PlateDataPtrs plate_data_list, std::string file_name, std::string file_path);
 private:
+    friend class Plater;
     bool layers_height_allowed() const;
 
     void update_fff_scene();
@@ -6904,7 +7191,32 @@ private:
 
     Slic3r::UndoRedo::Stack 	m_undo_redo_stack_main;
     Slic3r::UndoRedo::Stack 	m_undo_redo_stack_gizmos;
+    // Assembly view owns an independent Undo/Redo stack, fully decoupled from the prepare view / sidebar.
+    // It serializes m_assemble_model only and never touches the slicing / sidebar / project machinery.
+    Slic3r::UndoRedo::Stack 	m_undo_redo_stack_assemble;
     Slic3r::UndoRedo::Stack    *m_undo_redo_stack_active = &m_undo_redo_stack_main;
+    // Independent assembly model. Shallow clone of `model` (mesh data shared via shared_ptr, ObjectIDs preserved).
+    // Derived once per project and kept persistent across view switches, so structural edits in either view
+    // do not affect the other. Invalidated on project reset / load.
+    Slic3r::Model               m_assemble_model;
+    bool                        m_assemble_model_valid = false;
+    // The assembly undo/redo stack persists across view switches (so assembly-view edits stay undoable
+    // after leaving and re-entering). It must be reset to a fresh baseline whenever a prepare-side
+    // structural change (added / deleted volume or object, or a re-shared mesh) mutates m_assemble_model
+    // outside the assembly stack: the retained snapshots would otherwise no longer match the model and an
+    // undo could resurrect / drop the just-synced parts. This flag requests that reset on next entry.
+    bool                        m_assemble_undo_baseline_dirty = true;
+    // True when the independent assembly undo stack has project-modifying edits since the last
+    // project save. The main-stack up_to_date() check alone cannot see these edits, so close /
+    // new-project prompts must consult this flag (see priv::up_to_date).
+    bool                        m_assemble_project_dirty = false;
+    // timestamp -> guide UI cursor at that assemble-stack snapshot (grows with take_snapshot /
+    // pre-jump capture; pruned against live stack timestamps).
+    std::unordered_map<size_t, AssemblyGuideUiSnapshot> m_assemble_guide_ui_by_time;
+    // Set while a prepare-side structural restructure (split / combine) destroys and re-creates objects.
+    // Such internal removes are NOT user deletes and must not be propagated to the assembly model:
+    // the split/combine products keep the source part_guid, so the assembly view stays untouched.
+    bool                        m_suppress_assemble_delete_propagation = false;
     int                         m_prevent_snapshots = 0;     /* Used for avoid of excess "snapshoting".
                                                               * Like for "delete selected" or "set numbers of copies"
                                                               * we should call tack_snapshot just ones
@@ -6937,7 +7249,7 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
     , main_frame(main_frame)
     //BBS: add bed_exclude_area
     , config(Slic3r::DynamicPrintConfig::new_from_defaults_keys({
-        "printable_area", "bed_exclude_area", "wrapping_exclude_area", "extruder_printable_area", "bed_custom_texture", "bed_custom_model", "print_sequence",
+        "printable_area", "bed_exclude_area", "bed_heat_soak_area", "wrapping_exclude_area", "extruder_printable_area", "bed_custom_texture", "bed_custom_model", "print_sequence",
         "extruder_clearance_dist_to_rod", "extruder_clearance_max_radius",
         "extruder_clearance_height_to_lid", "extruder_clearance_height_to_rod",
 		"nozzle_height", "skirt_loops", "skirt_distance",
@@ -7304,6 +7616,11 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
         assemble_canvas->Bind(EVT_GLCANVAS_FORCE_UPDATE, [this](SimpleEvent&) { update(); });
         assemble_canvas->Bind(EVT_GLCANVAS_UNDO, [this](SimpleEvent&) { this->undo(); });
         assemble_canvas->Bind(EVT_GLCANVAS_REDO, [this](SimpleEvent&) { this->redo(); });
+        // Ctrl+A in the assembly view: select all on the assembly canvas itself (the prepare-view binding above only drives view3D).
+        assemble_canvas->Bind(EVT_GLCANVAS_SELECT_ALL, [this](SimpleEvent&) {
+            if (GLCanvas3D *c = assemble_view->get_canvas3d())
+                c->select_all();
+        });
     }
 
     if (wxGetApp().is_editor()) {
@@ -7694,8 +8011,11 @@ void Plater::priv::select_view_3D(const std::string& name, bool no_slice)
     }
     else if (name == "Assemble") {
         BOOST_LOG_TRIVIAL(info) << "select assemble view";
-        assemble_view->get_canvas3d()->active_view();
+        // set_current_panel binds the assembly canvas to m_assemble_model (derive / sync on real enter).
+        // active_view() must run AFTER that so deal_once_when_enter_assembly_view() rebuilds the assembly
+        // tree on m_assemble_model, not on the still-bound prepare model (would leave a_model tree empty).
         set_current_panel(assemble_view, no_slice);
+        assemble_view->get_canvas3d()->active_view();
     }
 
     //BBS update selection
@@ -8125,6 +8445,12 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     else
                         load_type  = static_cast<LoadType>(std::stoi(import_project_action));
 
+                    // check the loaded config if its not from BBL
+                    if (!is_bbl_vendor_config(config_loaded, wxGetApp().preset_bundle) && !check_project_config(config_loaded)) {
+                        load_config = false;
+                        show_info(q, _L("The 3mf file has invalid config, load geometry data only"), _L("Load 3mf"));
+                    }
+
                     // BBS: version check
                     Semver app_version = *(Semver::parse(SLIC3R_VERSION));
                     if (en_3mf_file_type == En3mfType::From_Prusa) {
@@ -8192,7 +8518,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             else {
                                 //if the minor version is not matched
                                 //if (file_version.min() != app_version.min()) {
-                                    Newer3mfVersionDialog newer_dlg(q, &file_version, &cloud_ver, "");
+                                Newer3mfVersionDialog newer_dlg(q, &file_version, &cloud_ver, "");
                                     auto res = newer_dlg.ShowModal();
                                 //}
                             }
@@ -8565,9 +8891,16 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 preset_bundle->extruder_nozzle_stat.set_force_keep_flag(false);
 
                                 // 导入的配置中存在有效nozzle_stats，则复用
-                                if (auto nozzle_stats_ptr = proj_cfg.option<ConfigOptionStrings>("extruder_nozzle_stats");
-                                    nozzle_stats_ptr && !(nozzle_stats_ptr->values.empty() || std::any_of(nozzle_stats_ptr->values.begin(), nozzle_stats_ptr->values.end(),
-                                                                                                          [](const std::string &elem) { return elem.empty(); }))) {
+                                // extruder_nozzle_stats_new holds the untranslated volume type names, while the legacy
+                                // key may have been downgraded on export, so it only serves older projects.
+                                auto nozzle_stats_valid = [](const ConfigOptionStrings *opt) {
+                                    return opt && !(opt->values.empty() || std::any_of(opt->values.begin(), opt->values.end(),
+                                                                                       [](const std::string &elem) { return elem.empty(); }));
+                                };
+                                const ConfigOptionStrings *nozzle_stats_ptr = proj_cfg.option<ConfigOptionStrings>("extruder_nozzle_stats_new");
+                                if (!nozzle_stats_valid(nozzle_stats_ptr))
+                                    nozzle_stats_ptr = proj_cfg.option<ConfigOptionStrings>("extruder_nozzle_stats");
+                                if (nozzle_stats_valid(nozzle_stats_ptr)) {
                                     preset_bundle->extruder_nozzle_stat = ExtruderNozzleStat(get_extruder_nozzle_stats(nozzle_stats_ptr->values));
                                 } else {
                                     // 打印机型切换或数据无效，则读取默认值
@@ -8577,6 +8910,15 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     for (size_t idx = 0; idx < nozzle_volume_opt->size(); ++idx) {
                                         preset_bundle->extruder_nozzle_stat.on_volume_type_switch(idx, NozzleVolumeType(nozzle_volume_opt->values[idx]));
                                     }
+                                }
+                                // The legacy key arrives downgraded from a project exported by this or a newer build,
+                                // and full_fff_config() derives the extruder variants from it before refreshing it from
+                                // extruder_nozzle_stat. Push the resolved stats back so project_config stays consistent.
+                                {
+                                    const std::vector<std::string> resolved_nozzle_stats = save_extruder_nozzle_stats_to_string(
+                                        preset_bundle->extruder_nozzle_stat.get_raw_stat());
+                                    proj_cfg.option<ConfigOptionStrings>("extruder_nozzle_stats", true)->values     = resolved_nozzle_stats;
+                                    proj_cfg.option<ConfigOptionStrings>("extruder_nozzle_stats_new", true)->values = resolved_nozzle_stats;
                                 }
                                 //BBS: rewrite wipe tower pos stored in 3mf file , the code above should be seriously reconsidered
                                  ConfigOptionFloats* wipe_tower_x = proj_cfg.opt<ConfigOptionFloats>("wipe_tower_x");
@@ -8954,11 +9296,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     instance->set_assemble_transformation(instance->get_transformation());
                 }
                 // BBS: keep each volume's assemble transformation in sync with its base transformation
-                for (ModelVolume *mv : object->volumes) {
-                    if (mv != nullptr && !mv->is_assemble_initialized()) {
-                        mv->set_assemble_transformation(mv->get_transformation());
-                    }
-                }
+                q->ensure_model_object_volume_assemble_initialized(object);
                 object->invalidate_bounding_box();
                 BOOST_LOG_TRIVIAL(info) << "STEP import: restore sub-assembly relative position for object \""
                                         << object->name << "\", compensation="
@@ -9015,6 +9353,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
             const bool steps_json_brought_in = !model.get_assembly_steps_json_str().empty();
             if (steps_json_brought_in)
                 q->model().set_assembly_steps_json_str(model.get_assembly_steps_json_str());
+            // Independent assembly object graph (rebuilt lazily on first assembly-view entry, meshes
+            // rebound from the prepare model by part_guid). Bridge it like the tree / steps json above.
+            if (!model.get_assembly_model_json_str().empty())
+                q->model().set_assembly_model_json_str(model.get_assembly_model_json_str());
 
             TextureImportResult texture_import_result;
             int texture_progress_start = progress_percent;
@@ -9114,21 +9456,49 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         ss << std::fixed << std::setprecision(2) << assembly_part_number_label_font_size;
                         wxGetApp().app_config->set("assembly_part_number_label_font_size", ss.str());
                     }
+                    if (!m_assemble_model_valid)
+                        derive_assemble_model();//reload existed 3mf
                 }
                 const bool step_position_compensated = apply_step_object_position_compensations(loaded_idxs, step_object_position_compensations);
+                bool       need_show_sole_text_notice = false;
                 if (type_step && !model.step_import_tree_nodes.empty() && !loaded_idxs.empty()) {
                     BOOST_LOG_TRIVIAL(info) << "STEP import: forward tree to assemble canvas, node_count=" << model.step_import_tree_nodes.size()
                                             << ", loaded_object_count=" << loaded_idxs.size();
+                    // A STEP import establishes an assembly structure up front. Capture it into the
+                    // independent assembly model BEFORE the prepare-side merge below, so the assembly
+                    // model / tree keeps each STEP part as its own object (pre-merge structure).
+                    // First STEP: full derive. Later STEPs: the model already exists, so append the
+                    // just-loaded (still separate) objects instead of skipping -- otherwise a second STEP
+                    // import is never captured and its assembly objects are lost.
+                    //
+                    // Derive/sync MUST happen before seeding steps. After visiting assemble view the
+                    // canvas stays bound to m_assemble_model; new_project clears that model's objects
+                    // but leaves the binding. Seeding first would write into an empty model (or into
+                    // the prepare model on a cold start) and then be wiped by `m_assemble_model = model`.
+                    if (!m_assemble_model_valid)
+                        derive_assemble_model();//step import first
+                    else
+                        sync_assemble_model_on_enter(loaded_idxs);
                     if (GLCanvas3D *assemble_canvas = q->get_assmeble_canvas3D()) {
+                        assemble_canvas->set_model(&m_assemble_model);
                         assemble_canvas->append_step_import_to_assembly_tree(model.step_import_tree_nodes, loaded_idxs, model.step_import_path);
+                        assemble_canvas->notify_step_import();
                     }
+                    // Keep prepare-side JSON/tree in sync so save without re-entering assemble view
+                    // still persists the auto-seeded steps.
+                    sync_assemble_steps_to_main_model();
+                    // Now merge the objects brought in by THIS STEP import into a single multipart object on
+                    auto is_split_compound = wxGetApp().app_config->get_bool("is_split_compound");
+                    need_show_sole_text_notice = is_split_compound;
+                    if (!is_split_compound && loaded_idxs.size() > 1) // Make it more convenient for users
+                        wxGetApp().obj_list()->merge_objects(loaded_idxs);
                 }
                 if (step_position_compensated) {
                     update();
                     for (const size_t idx : loaded_idxs) wxGetApp().obj_list()->update_info_items(idx);
                     object_list_changed();
                 }
-                if (step_subassembly_split && !loaded_idxs.empty()) {
+                if (step_subassembly_split && loaded_idxs.size() > 1 && need_show_sole_text_notice) {
                     q->get_notification_manager()
                         ->bbl_show_sole_text_notification(NotificationType::CustomNotification,
                                                           _u8L("The imported STEP file is split by sub-assembly, so some objects may not be placed on the build plate at first.\n"
@@ -9408,10 +9778,7 @@ std::vector<size_t> Plater::priv::load_model_objects(const ModelObjectPtrs& mode
                     }
                 }
                 // BBS: also initialize per-volume assemble transformation so the assembly view can render new volumes correctly even before any explicit per-volume edit.
-                for (ModelVolume *mv : model_object->volumes) {
-                    if (mv != nullptr && !mv->is_assemble_initialized())
-                        mv->set_assemble_transformation(mv->get_transformation());
-                }
+                q->ensure_model_object_volume_assemble_initialized(model_object);
             }
         }
     }
@@ -9524,12 +9891,26 @@ bool Plater::priv::run_textured_mesh_import_dialog(Slic3r::Model& loaded_model, 
 
     BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: opening texture import dialog";
 
-    const std::vector<std::string> filament_color_strs = wxGetApp().plater()->get_extruder_colors_from_plater_config();
-
-    std::vector<std::string> filament_names;
+    std::vector<TextureFilamentEntry> filament_entries;
     {
         auto& preset_bundle = *wxGetApp().preset_bundle;
-        for (size_t i = 0; i < filament_color_strs.size(); ++i) {
+        auto& project_config = preset_bundle.project_config;
+        auto* colours_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+        auto* is_mixed_opt = project_config.option<ConfigOptionBools>("filament_is_mixed");
+        auto* type_opt = project_config.option<ConfigOptionStrings>("filament_type");
+        auto* components_opt = project_config.option<ConfigOptionStrings>("filament_mixed_components");
+        auto* ratios_opt = project_config.option<ConfigOptionStrings>("filament_mixed_sublayer_ratios");
+        const size_t total = preset_bundle.filament_presets.size();
+        filament_entries.reserve(total);
+        for (size_t i = 0; i < total; ++i) {
+            TextureFilamentEntry entry;
+            entry.kind = (is_mixed_opt && i < is_mixed_opt->values.size() && is_mixed_opt->values[i]) ?
+                TextureFilamentKind::ExistingMixed : TextureFilamentKind::ExistingPhysical;
+            entry.dialog_index = (int)filament_entries.size();
+            entry.project_config_index = i;
+            entry.color_hex = (colours_opt && i < colours_opt->values.size()) ? colours_opt->values[i] : "#808080";
+            entry.type = (type_opt && i < type_opt->values.size()) ? type_opt->values[i] : "";
+
             std::string name;
             if (i < preset_bundle.filament_presets.size()) {
                 auto* preset = preset_bundle.filaments.find_preset(preset_bundle.filament_presets[i]);
@@ -9538,11 +9919,23 @@ bool Plater::priv::run_textured_mesh_import_dialog(Slic3r::Model& loaded_model, 
             }
             if (name.empty())
                 name = "Filament " + std::to_string(i + 1);
-            filament_names.push_back(name);
+            entry.name = name;
+
+            if (entry.kind == TextureFilamentKind::ExistingMixed) {
+                if (components_opt && i < components_opt->values.size())
+                    entry.mixed_components = Slic3r::parse_mixed_components(components_opt->values[i]);
+                std::vector<double> ratios = Slic3r::parse_mixed_ratios(
+                    ratios_opt && i < ratios_opt->values.size() ? ratios_opt->values[i] : "",
+                    entry.mixed_components.size());
+                entry.mixed_ratios.reserve(ratios.size());
+                for (double ratio : ratios)
+                    entry.mixed_ratios.push_back((int)std::lround(ratio * 100.0));
+            }
+            filament_entries.push_back(std::move(entry));
         }
     }
 
-    TextureImportDialog dlg(q, *loaded_model.texture_mesh, filament_color_strs, filament_names,
+    TextureImportDialog dlg(q, *loaded_model.texture_mesh, filament_entries,
                             std::move(cancel_callback), std::move(progress_callback));
     if (dlg.ShowModal() != wxID_OK) {
         if (dlg.was_skipped()) {
@@ -9581,6 +9974,8 @@ bool Plater::priv::run_textured_mesh_import_dialog(Slic3r::Model& loaded_model, 
     result.matches = std::move(final_matches);
     result.new_filament_colors = dlg.get_new_filament_colors();
     result.new_filament_preset_names = dlg.get_new_filament_preset_names();
+    result.new_mixed_filaments = dlg.get_new_mixed_filaments();
+    result.filament_entries = dlg.get_filament_entries();
     result.existing_filament_count = dlg.get_existing_filament_count();
     result.skipped = dlg.was_skipped();
     return true;
@@ -9608,45 +10003,93 @@ void Plater::priv::apply_textured_mesh_import_result(Slic3r::Model& loaded_model
     if (!update_apply_progress(0, _L("Applying texture colors...")))
         return;
 
-    auto build_filament_index_remap = [&result]() {
-        const size_t existing_count = result.existing_filament_count;
-        const size_t new_count      = result.new_filament_colors.size();
-
-        std::vector<int> slot_order;
-        slot_order.reserve(existing_count + new_count);
-        for (size_t i = 0; i < existing_count; ++i)
-            slot_order.push_back((int)i);
-
-        size_t physical_count = existing_count;
+    auto collect_physical_color_strs = []() {
+        std::vector<std::string> colors;
         auto& project_config = wxGetApp().preset_bundle->project_config;
-        if (auto* is_mixed_opt = project_config.option<ConfigOptionBools>("filament_is_mixed")) {
-            physical_count = 0;
-            for (size_t i = 0; i < existing_count; ++i) {
-                if (i >= is_mixed_opt->values.size() || !is_mixed_opt->values[i])
-                    ++physical_count;
-            }
+        auto* colours_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+        auto* is_mixed_opt = project_config.option<ConfigOptionBools>("filament_is_mixed");
+        const size_t total = wxGetApp().preset_bundle->filament_presets.size();
+        for (size_t i = 0; i < total; ++i) {
+            const bool is_mixed = is_mixed_opt && i < is_mixed_opt->values.size() && is_mixed_opt->values[i];
+            if (!is_mixed)
+                colors.push_back(colours_opt && i < colours_opt->values.size() ? colours_opt->values[i] : "#808080");
         }
-
-        for (size_t i = 0; i < new_count; ++i) {
-            const int dialog_idx = (int)(existing_count + i);
-            const size_t total = slot_order.size();
-            const size_t insert_pos = std::min(physical_count + i, total);
-            slot_order.push_back(dialog_idx);
-            if (insert_pos < total)
-                std::rotate(slot_order.begin() + insert_pos, slot_order.begin() + total, slot_order.end());
-        }
-
-        std::vector<int> remap(existing_count + new_count, -1);
-        for (size_t final_idx = 0; final_idx < slot_order.size(); ++final_idx) {
-            int dialog_idx = slot_order[final_idx];
-            if (dialog_idx >= 0 && dialog_idx < (int)remap.size())
-                remap[dialog_idx] = (int)final_idx;
-        }
-        return remap;
+        return colors;
     };
 
+    const auto& entries = result.filament_entries;
+    // Final sidebar ordering produced here (ExistingPhysical -> NewPhysical ->
+    // ExistingMixed -> NewMixed) MUST stay in sync with
+    // TextureImportDialog::compute_display_numbers(), which mirrors this order
+    // so the import dialog shows the same IDs the sidebar will show after OK.
+    std::vector<int> filament_index_remap(entries.size(), -1);
+    size_t existing_physical_count = 0;
+    size_t new_physical_count = 0;
+    for (const auto& entry : entries) {
+        if (entry.kind == TextureFilamentKind::ExistingPhysical)
+            ++existing_physical_count;
+        else if (entry.kind == TextureFilamentKind::NewPhysical)
+            ++new_physical_count;
+    }
+
+    for (const auto& entry : entries) {
+        if (entry.dialog_index < 0 || entry.dialog_index >= (int)filament_index_remap.size())
+            continue;
+        if (entry.kind == TextureFilamentKind::ExistingPhysical) {
+            filament_index_remap[entry.dialog_index] = (int)entry.project_config_index;
+        } else if (entry.kind == TextureFilamentKind::ExistingMixed) {
+            filament_index_remap[entry.dialog_index] = (int)(entry.project_config_index + new_physical_count);
+        }
+    }
+
+    size_t new_physical_order = 0;
+    for (const auto& entry : entries) {
+        if (entry.kind != TextureFilamentKind::NewPhysical)
+            continue;
+        wxColour new_col(entry.color_hex);
+        const size_t final_idx = existing_physical_count + new_physical_order;
+        sidebar->add_custom_filament(new_col, entry.preset_name);
+        if (entry.dialog_index >= 0 && entry.dialog_index < (int)filament_index_remap.size())
+            filament_index_remap[entry.dialog_index] = (int)final_idx;
+        BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: created pending physical filament dialog="
+                                << entry.dialog_index << " final=" << final_idx
+                                << " color=" << entry.color_hex
+                                << " preset=" << entry.preset_name;
+        ++new_physical_order;
+    }
+
+    std::vector<std::string> physical_colors_for_mixing = collect_physical_color_strs();
+    for (const auto& mixed : result.new_mixed_filaments) {
+        MixedFilamentResult mixed_result;
+        mixed_result.ratios = mixed.ratios;
+        mixed_result.components.reserve(mixed.component_dialog_indices.size());
+        bool valid_components = true;
+        for (int component_dialog_idx : mixed.component_dialog_indices) {
+            if (component_dialog_idx < 0 || component_dialog_idx >= (int)filament_index_remap.size() ||
+                filament_index_remap[component_dialog_idx] < 0) {
+                valid_components = false;
+                break;
+            }
+            mixed_result.components.push_back((unsigned int)(filament_index_remap[component_dialog_idx] + 1));
+        }
+        if (!valid_components || mixed_result.components.size() < 2 ||
+            mixed_result.components.size() != mixed_result.ratios.size()) {
+            BOOST_LOG_TRIVIAL(warning) << "handle_textured_mesh_import: invalid pending mixed filament dialog="
+                                       << mixed.dialog_index;
+            continue;
+        }
+
+        const int final_idx = (int)wxGetApp().preset_bundle->filament_presets.size();
+        if (create_mixed_filament_from_result(sidebar, mixed_result, physical_colors_for_mixing)) {
+            if (mixed.dialog_index >= 0 && mixed.dialog_index < (int)filament_index_remap.size())
+                filament_index_remap[mixed.dialog_index] = final_idx;
+            physical_colors_for_mixing = collect_physical_color_strs();
+            BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: created pending mixed filament dialog="
+                                    << mixed.dialog_index << " final=" << final_idx;
+        }
+    }
+
     std::vector<Slic3r::FilamentMatch> remapped_matches = final_matches;
-    const std::vector<int> filament_index_remap = build_filament_index_remap();
     for (auto& m : remapped_matches) {
         if (m.filament_index < 0)
             continue;
@@ -9677,26 +10120,6 @@ void Plater::priv::apply_textured_mesh_import_result(Slic3r::Model& loaded_model
     if (min_used_filament_1based < 0)
         BOOST_LOG_TRIVIAL(warning) << "handle_textured_mesh_import: cannot determine base filament from painted faces";
 
-    // Create new filaments that were virtually assigned in the dialog
-    const auto& new_colors = result.new_filament_colors;
-    const auto& new_preset_names = result.new_filament_preset_names;
-    if (!new_preset_names.empty() && new_preset_names.size() != new_colors.size()) {
-        BOOST_LOG_TRIVIAL(warning) << "handle_textured_mesh_import: new filament preset count "
-                                   << new_preset_names.size() << " does not match color count "
-                                   << new_colors.size();
-    }
-    for (size_t i = 0; i < new_colors.size(); ++i) {
-        const auto& c = new_colors[i];
-        wxColour new_col((unsigned char)(c[0] * 255.f),
-                         (unsigned char)(c[1] * 255.f),
-                         (unsigned char)(c[2] * 255.f));
-        const std::string preset_name = i < new_preset_names.size() ? new_preset_names[i] : std::string();
-        sidebar->add_custom_filament(new_col, preset_name);
-        BOOST_LOG_TRIVIAL(info) << "handle_textured_mesh_import: created filament "
-                                << (result.existing_filament_count + i) << " color="
-                                << new_col.GetAsString().ToStdString()
-                                << " preset=" << preset_name;
-    }
     if (!update_apply_progress(25, _L("Applying texture colors...")))
         return;
 
@@ -10019,6 +10442,9 @@ void Plater::priv::remove(size_t obj_idx)
         view3D->enable_layers_editing(false);
 
     m_ui_jobs.cancel_all();
+    // Propagate the prepare-side delete to the independent assembly model before destroying the object.
+    if (obj_idx < model.objects.size())
+        propagate_delete_to_assemble(*model.objects[obj_idx]);
     model.delete_object(obj_idx);
     //BBS: notify partplate the instance removed
     partplate_list.notify_instance_removed(obj_idx, -1);
@@ -10054,6 +10480,8 @@ bool Plater::priv::delete_object_from_model(size_t obj_idx, bool refresh_immedia
     if (obj->is_cut())
         sidebar->obj_list()->invalidate_cut_info_for_object(obj_idx);
 
+    // Propagate the prepare-side delete to the independent assembly model before destroying the object.
+    propagate_delete_to_assemble(*obj);
     model.delete_object(obj_idx);
     //BBS: notify partplate the instance removed
     partplate_list.notify_instance_removed(obj_idx, -1);
@@ -10087,6 +10515,9 @@ void Plater::priv::delete_all_objects_from_model()
     //BBS: update partplate
     partplate_list.clear();
 
+    // Propagate the prepare-side delete-all to the independent assembly model before destroying objects.
+    for (ModelObject *po : model.objects)
+        propagate_delete_to_assemble(*po);
     model.clear_objects();
     update();
     // Delete object from Sidebar list. Do it after update, so that the GLScene selection is updated with the modified model.
@@ -10135,6 +10566,7 @@ void Plater::priv::reset(bool apply_presets_change)
     // Stop and reset the Print content.
     this->background_process.reset();
     model.clear_objects();
+    invalidate_assemble_model_on_project_reset();
     assemble_view->get_canvas3d()->reset_explosion_ratio();
     update();
 
@@ -10285,9 +10717,20 @@ void Plater::find_new_position(const ModelInstancePtrs &instances)
         m.apply();
 }
 
-void Plater::priv::split_object()
+void Plater::priv::split_object(ModelObject *mo, bool ignore_warning)
 {
-    int obj_idx = get_selected_object_idx();
+    if (mo == nullptr) {
+        int obj_idx = get_selected_object_idx();
+        if (obj_idx == -1 || obj_idx >= model.objects.size())
+            return;
+        mo = model.objects[obj_idx];
+        if (mo == nullptr) return;
+    }
+    // Resolve the object's index by identity instead of the current selection, so this also works while
+    // iterating a multi-object selection (where get_selected_object_idx() returns -1).
+    int obj_idx = -1;
+    for (int i = 0; i < (int) model.objects.size(); ++i)
+        if (model.objects[i] == mo) { obj_idx = i; break; }
     if (obj_idx == -1)
         return;
 
@@ -10298,15 +10741,17 @@ void Plater::priv::split_object()
 
     wxBusyCursor wait;
     if (current_model_object->volumes.size() == 1) {
-        split_volume();//keep color
+        split_volume(ignore_warning); // keep color
         new_model = model;
         current_model_object = new_model.objects[obj_idx];
     }
     ModelObjectPtrs new_objects;
     current_model_object->split(&new_objects);
-    if (new_objects.size() == 1)
-        // #ysFIXME use notification
-        Slic3r::GUI::warning_catcher(q, _L("The selected object couldn't be split."));
+    if (new_objects.size() == 1) {
+        if (!ignore_warning) {
+            Slic3r::GUI::warning_catcher(q, _L("The selected object couldn't be split."));
+        }
+    }
     else
     {
         // BBS no solid parts removed
@@ -10318,7 +10763,14 @@ void Plater::priv::split_object()
 
         Plater::TakeSnapshot snapshot(q, "Split to Objects");
 
-        remove(obj_idx);
+        // split removes the original prepare object and re-adds the per-volume products. That internal
+        // remove must not propagate as a delete to the assembly model: the products keep the source
+        // part_guid (see ModelObject::split), so the assembly view keeps referencing the same parts.
+        {
+            m_suppress_assemble_delete_propagation = true;
+            remove(obj_idx);
+            m_suppress_assemble_delete_propagation = false;
+        }
 
         // load all model objects at once, otherwise the plate would be rearranged after each one
         // causing original positions not to be kept
@@ -10333,9 +10785,8 @@ void Plater::priv::split_object()
     }
 }
 
-void Plater::priv::split_volume()
-{
-    wxGetApp().obj_list()->split();
+void Plater::priv::split_volume(bool ignore_warning) {
+    wxGetApp().obj_list()->split(ignore_warning);
 }
 
 void Plater::priv::scale_selection_to_fit_print_volume()
@@ -10984,7 +11435,11 @@ void Plater::priv::replace_with_stl()
 
     wxString title = _L("Select a new file");
     title += ":";
-    wxFileDialog dialog(q, title, "", from_u8(input_path.filename().string()), file_wildcards(FT_MODEL), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    // Open the dialog in the original file's folder (falling back to the last
+    // used directory) instead of the current working directory.
+    const wxString start_dir = input_path.has_parent_path() ? from_u8(input_path.parent_path().string())
+                                                            : from_u8(wxGetApp().app_config->get_last_dir());
+    wxFileDialog dialog(q, title, start_dir, from_u8(input_path.filename().string()), file_wildcards(FT_MODEL), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
     if (dialog.ShowModal() != wxID_OK)
         return;
 
@@ -11150,7 +11605,11 @@ void Plater::priv::reload_from_disk()
         title += " (" + from_u8(search.filename().string()) + ")";
 #endif // __APPLE__
         title += ":";
-        wxFileDialog dialog(q, title, "", from_u8(search.filename().string()), file_wildcards(FT_MODEL), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+        // Open the dialog in the folder where the file was expected (falling
+        // back to the last used directory) instead of the working directory.
+        const wxString start_dir = search.has_parent_path() ? from_u8(search.parent_path().string())
+                                                            : from_u8(wxGetApp().app_config->get_last_dir());
+        wxFileDialog dialog(q, title, start_dir, from_u8(search.filename().string()), file_wildcards(FT_MODEL), wxFD_OPEN | wxFD_FILE_MUST_EXIST);
         if (dialog.ShowModal() != wxID_OK)
             return;
 
@@ -11673,13 +12132,32 @@ void Plater::priv::set_current_panel(wxPanel* panel, bool no_slice)
             Selection::IndicesList select_idxs = assemble_canvas->get_selection().get_volume_idxs();
             Selection& view3d_selection = view3D->get_canvas3d()->get_selection();
             view3d_selection.clear();
-            for (unsigned int idx : select_idxs) {
-                auto v = assemble_canvas->get_selection().get_volume(idx);
-                auto real_idx = view3d_selection.query_real_volume_idx_from_other_view(v->object_idx(), v->instance_idx(), v->volume_idx());
-                if (real_idx >= 0) {
-                    view3d_selection.add(real_idx, false);
+            // Independent Models: map the assembly selection back to the prepare view by stable part_guid
+            // (an assembly volume references its prepare part via assembly_src_guid), not by index.
+            // Same batch add_volumes pattern as prepare → assemble below.
+            Model* a_model = assemble_canvas->get_selection().get_model();
+            std::vector<unsigned int> view3d_volume_idxs;
+            view3d_volume_idxs.reserve(select_idxs.size());
+            if (a_model != nullptr) {
+                for (unsigned int idx : select_idxs) {
+                    const GLVolume* v = assemble_canvas->get_selection().get_volume(idx);
+                    if (v == nullptr)
+                        continue;
+                    const int real_idx = view3d_selection.query_real_volume_idx_from_other_model_volume(v, *a_model, true);
+                    if (real_idx >= 0)
+                        view3d_volume_idxs.push_back((unsigned int) real_idx);
                 }
             }
+            if (!view3d_volume_idxs.empty())
+                view3d_selection.add_volumes(Selection::Volume, view3d_volume_idxs, true);
+            // Leave the independent assembly undo/redo stack, but keep the hidden assembly canvas
+            // bound to m_assemble_model. Rebinding it to the prepare model breaks the independent
+            // assembly-view model contract and makes prepare-side preview code lose assembly GLVolumes.
+            // leave_assemble_stack() already wrote assembly-view filament / painting edits back onto the
+            // prepare model (via sync_assemble_steps_to_main_model), so refresh the prepare scene to show
+            // the updated colors.
+            leave_assemble_stack();
+            view3D->reload_scene(true);
         }
 
         view3D->get_canvas3d()->bind_event_handlers();
@@ -11708,8 +12186,12 @@ void Plater::priv::set_current_panel(wxPanel* panel, bool no_slice)
         q->invalid_all_plate_thumbnails();
         if (old_panel == view3D)
             view3D->get_canvas3d()->unbind_event_handlers();
-        else if (old_panel == assemble_view)
+        else if (old_panel == assemble_view) {
             assemble_view->get_canvas3d()->unbind_event_handlers();
+            // Leave the independent assembly undo/redo stack, but keep the hidden assembly canvas
+            // bound to m_assemble_model for the same reason as the view3D path above.
+            leave_assemble_stack();
+        }
 
         preview->get_canvas3d()->bind_event_handlers();
 
@@ -11763,20 +12245,52 @@ void Plater::priv::set_current_panel(wxPanel* panel, bool no_slice)
             preview->get_canvas3d()->unbind_event_handlers();
 
         assemble_view->get_canvas3d()->bind_event_handlers();
+        // Only (re)build the independent assembly model + stack when actually entering from another panel,
+        // never when re-selecting the assembly view while already in it (would re-open an already-open stack).
+        const bool real_enter_assemble = (old_panel != assemble_view);
+        if (real_enter_assemble) {
+            // Derive the persistent independent assembly model once per project (shared meshes), then keep
+            // it across view switches so assembly edits and structure survive and stay independent of the
+            // prepare-side structural edits (split / combine). Bind the assembly canvas + its undo/redo
+            // stack to m_assemble_model only.
+            //
+            // Prepare delete(+propagate) can empty the live assemble model while leaving valid=true;
+            // prepare undo restores objects / assembly_model.json on the main model only. Detect that
+            // hole and re-derive from JSON (or clone) so relationships are restored — otherwise sync
+            // treats every prepare object as new and calls set_assembly_pos, wiping assembly poses.
+            if (!m_assemble_model_valid || assemble_model_needs_rederive_from_prepare())
+                derive_assemble_model();//set_current_panel
+            // Always sync after derive/keep: refresh mesh/scale/render, and append truly new prepare
+            // objects that are not in the persisted assembly graph.
+            if (m_assemble_model_valid)
+                sync_assemble_model_on_enter();
+            assemble_view->get_canvas3d()->set_model(&m_assemble_model);
+        }
         assemble_view->reload_scene(true);
         assemble_view->get_canvas3d()->set_ignore_left_up();
+        // Open the independent assembly undo/redo stack (takes the initial snapshot of m_assemble_model).
+        if (real_enter_assemble)
+            enter_assemble_stack();
         if (old_panel == view3D) {
             GLCanvas3D* view3D_canvas = view3D->get_canvas3d();
             Selection::IndicesList select_idxs = view3D_canvas->get_selection().get_volume_idxs();
             Selection& assemble_selection = assemble_view->get_canvas3d()->get_selection();
             assemble_selection.clear();
+            // Prepare and assembly views now own independent Models (prepare may be merged to one object,
+            // assembly keeps the original structure), so object/volume indices no longer line up. Map the
+            // selection across models by stable part_guid instead of by index.
+            std::vector<unsigned int> assembly_volume_idxs;
+            assembly_volume_idxs.reserve(select_idxs.size());
             for (unsigned int idx : select_idxs) {
-                auto v        = view3D_canvas->get_selection().get_volume(idx);
-                auto real_idx = assemble_selection.query_real_volume_idx_from_other_view(v->object_idx(), v->instance_idx(), v->volume_idx());
-                if (real_idx >= 0) {
-                    assemble_selection.add(real_idx, false);
-                }
+                const GLVolume* v = view3D_canvas->get_selection().get_volume(idx);
+                if (v == nullptr)
+                    continue;
+                const int real_idx = assemble_selection.query_real_volume_idx_from_other_model_volume(v, model, false);
+                if (real_idx >= 0)
+                    assembly_volume_idxs.push_back((unsigned int) real_idx);
             }
+            if (!assembly_volume_idxs.empty())
+                assemble_selection.add_volumes(Selection::Volume, assembly_volume_idxs, true);
         }
 
         // Force the pending sidebar-collapse / panel layout to settle synchronously
@@ -12023,6 +12537,9 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
 
 void Plater::priv::on_slicing_update(SlicingStatusEvent &evt)
 {
+    if (evt.status.is_helio && !helio_background_process.is_action_current(evt.generation)) {
+        return;
+    }
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": event_type %1%, percent %2%, text %3%") % evt.GetEventType() % evt.status.percent % evt.status.text;
     //BBS: add slice project logic
     std::string title_text = _u8L("Slicing");
@@ -12423,9 +12940,10 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         if (exporting_status == ExportingStatus::EXPORTING_TO_LOCAL && !has_error)
             notification_manager->push_exporting_finished_notification(last_output_path, last_output_dir_path, false);
 
-        // Show tutorial popup after successful slicing (if tutorial is active)
+        // Show tutorial popup after successful slicing (if Helio is enabled and tutorial is active)
         if (!has_error && !evt.cancelled() && evt.success() && is_finished) {
-            if (wxGetApp().app_config->get("helio_first_time_tutorial") == "active") {
+            if (wxGetApp().app_config->get("helio_enable") == "true" &&
+                wxGetApp().app_config->get("helio_first_time_tutorial") == "active") {
                 wxString tutorial_msg = _L("Great! Now click the Helio button to start optimization.");
                 notification_manager->push_notification(
                     NotificationType::CustomNotification,
@@ -12554,7 +13072,7 @@ void Plater::priv::on_action_open_project(SimpleEvent&)
 void Plater::priv::on_action_slice_plate(SimpleEvent&)
 {
     if (q != nullptr) {
-        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice plate event\n" ;
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice plate event\n";
         //BBS update extruder params and speed table before slicing
         const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
         auto& print = q->get_partplate_list().get_current_fff_print();
@@ -12611,19 +13129,21 @@ static std::vector<std::string> extract_material_keywords(const std::string& mat
 
 // Helper function to find similar materials based on keywords
 static std::vector<HelioQuery::SupportedData> find_similar_materials(
+    const SupportDataCatalogPairView& support_data,
     const std::string& target_name,
     const std::vector<std::string>& keywords)
 {
     std::vector<HelioQuery::SupportedData> similar_materials;
+    const auto& supported_materials = support_data.materials;
 
-    if (keywords.empty()) {
+    if (keywords.empty() || !supported_materials) {
         return similar_materials;
     }
 
     std::string lower_target = target_name;
     boost::algorithm::to_lower(lower_target);
 
-    for (const HelioQuery::SupportedData& pdata : HelioQuery::global_supported_materials) {
+    for (const HelioQuery::SupportedData& pdata : *supported_materials) {
         if (pdata.native_name.empty()) {
             continue;
         }
@@ -12673,14 +13193,19 @@ static std::vector<std::string> extract_printer_keywords(const std::string& prin
 
 // Helper function to find similar printers based on keywords
 static std::vector<HelioQuery::SupportedData> find_similar_printers(
+    const SupportDataCatalogPairView& support_data,
     const std::string& target_name,
     const std::vector<std::string>& keywords)
 {
     std::vector<HelioQuery::SupportedData> similar_printers;
+    const auto& supported_printers = support_data.printers;
+    if (!supported_printers) {
+        return similar_printers;
+    }
 
     // If no keywords found, return all printers as options
     if (keywords.empty()) {
-        for (const HelioQuery::SupportedData& pdata : HelioQuery::global_supported_printers) {
+        for (const HelioQuery::SupportedData& pdata : *supported_printers) {
             if (!pdata.native_name.empty()) {
                 similar_printers.push_back(pdata);
             }
@@ -12691,7 +13216,7 @@ static std::vector<HelioQuery::SupportedData> find_similar_printers(
     std::string lower_target = target_name;
     boost::algorithm::to_lower(lower_target);
 
-    for (const HelioQuery::SupportedData& pdata : HelioQuery::global_supported_printers) {
+    for (const HelioQuery::SupportedData& pdata : *supported_printers) {
         if (pdata.native_name.empty()) {
             continue;
         }
@@ -12849,7 +13374,8 @@ struct FilamentSupportInfo {
 };
 
 // Helper function to check if a single filament is supported by Helio and get its material ID
-static FilamentSupportInfo check_filament_helio_support(const std::string& filament_preset_name, int extruder_index)
+static FilamentSupportInfo check_filament_helio_support(const SupportDataCatalogPairView& support_data,
+                                                        const std::string& filament_preset_name, int extruder_index)
 {
     FilamentSupportInfo info;
     info.preset_name = filament_preset_name;
@@ -12873,7 +13399,12 @@ static FilamentSupportInfo check_filament_helio_support(const std::string& filam
     // Find best (longest) match to prefer specific materials over generic ones
     size_t best_match_length = 0;
 
-    for (const HelioQuery::SupportedData& pdata : HelioQuery::global_supported_materials) {
+    const auto& supported_materials = support_data.materials;
+    if (!supported_materials) {
+        return info;
+    }
+
+    for (const HelioQuery::SupportedData& pdata : *supported_materials) {
         if (pdata.native_name.empty()) continue;
 
         std::string native_name = pdata.native_name;
@@ -12990,12 +13521,6 @@ public:
         warning_box->SetSizer(warning_sizer);
         main_sizer->Add(warning_box, 0, wxALL, wxWindowBase::FromDIP(15, this));
 
-        // Future support message
-        Label* future_msg = new Label(this, Label::Body_13,
-            _L("True multi-material support will be added in a future update."), LB_AUTO_WRAP);
-        future_msg->SetForegroundColour(StateColor::darkModeColorFor(wxColour("#6B6B6B")));
-        future_msg->Wrap(wxWindowBase::FromDIP(470, this));
-        main_sizer->Add(future_msg, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, wxWindowBase::FromDIP(15, this));
 
         // Option 1: Proceed with single filament
         StaticBox* option1_box = new StaticBox(this, wxID_ANY, wxDefaultPosition,
@@ -13178,6 +13703,32 @@ public:
 
         option2_box->SetSizer(option2_sizer);
         main_sizer->Add(option2_box, 0, wxLEFT | wxRIGHT | wxBOTTOM, wxWindowBase::FromDIP(15, this));
+        wxColour option3_bg = is_dark_mode ? wxColour(30, 45, 70) : wxColour("#E3F2FD");
+        wxColour option3_border = is_dark_mode ? wxColour(100, 181, 246) : wxColour("#2196F3");
+        wxColour option3_text_color = is_dark_mode ? wxColour(240, 240, 240) : text_color;
+        // Option 3: Enable multi-material optimization
+        StaticBox* option3_box = new StaticBox(this, wxID_ANY, wxDefaultPosition,
+                                               wxSize(wxWindowBase::FromDIP(470, this), -1));
+        option3_box->SetBackgroundColor(StateColor(std::make_pair(option3_bg, (int)StateColor::Normal)));
+        option3_box->SetBackgroundColour(option3_bg);
+        option3_box->SetBorderColor(StateColor(std::make_pair(option3_border, (int)StateColor::Normal)));
+        option3_box->SetBorderWidth(1);
+        option3_box->SetCornerRadius(wxWindowBase::FromDIP(6, this));
+
+        wxBoxSizer* option3_sizer = new wxBoxSizer(wxVERTICAL);
+        option3_sizer->AddSpacer(wxWindowBase::FromDIP(12, this));
+        Label* option3_title = new Label(option3_box, Label::Head_14, _L("Option 3: Enable multi-material optimization"));
+        option3_title->SetForegroundColour(option3_text_color);
+        option3_sizer->Add(option3_title, 0, wxLEFT | wxRIGHT, wxWindowBase::FromDIP(16, this));
+        option3_sizer->AddSpacer(wxWindowBase::FromDIP(8, this));
+        Label* option3_desc = new Label(option3_box, Label::Body_13,
+            _L("Click third-party icon → Enable Helio Additive → Check \"Experimental: Enable multi-material support\""), LB_AUTO_WRAP);
+        option3_desc->SetForegroundColour(option3_text_color);
+        option3_desc->Wrap(wxWindowBase::FromDIP(440, this));
+        option3_sizer->Add(option3_desc, 0, wxEXPAND | wxLEFT | wxRIGHT, wxWindowBase::FromDIP(16, this));
+        option3_sizer->AddSpacer(wxWindowBase::FromDIP(12, this));
+        option3_box->SetSizer(option3_sizer);
+        main_sizer->Add(option3_box, 0, wxLEFT | wxRIGHT | wxBOTTOM, wxWindowBase::FromDIP(15, this));
 
         SetSizerAndFit(main_sizer);
         {
@@ -13516,9 +14067,10 @@ private:
 // Progress dialog shown while re-fetching supported printers/materials from Helio
 class HelioSyncProgressDialog : public DPIDialog {
 public:
-    HelioSyncProgressDialog(wxWindow* parent)
+    HelioSyncProgressDialog(wxWindow* parent, bool wait_for_refresh_completion = false)
         : DPIDialog(parent, wxID_ANY, _L("Syncing Data"),
                    wxDefaultPosition, wxDefaultSize, wxCAPTION)
+        , m_wait_for_refresh_completion(wait_for_refresh_completion)
     {
         SetBackgroundColour(StateColor::darkModeColorFor(*wxWHITE));
 
@@ -13535,7 +14087,12 @@ public:
                               wxSize(wxWindowBase::FromDIP(300, this), -1), wxGA_HORIZONTAL);
         m_gauge->Pulse();
         sizer->Add(m_gauge, 0, wxALIGN_CENTER | wxLEFT | wxRIGHT, wxWindowBase::FromDIP(20, this));
-        sizer->AddSpacer(wxWindowBase::FromDIP(20, this));
+        sizer->AddSpacer(wxWindowBase::FromDIP(10, this));
+
+        m_cancel_btn = new Button(this, _L("Cancel"));
+        m_cancel_btn->Bind(wxEVT_BUTTON, &HelioSyncProgressDialog::OnCancel, this);
+        sizer->Add(m_cancel_btn, 0, wxALIGN_CENTER | wxLEFT | wxRIGHT | wxBOTTOM, wxWindowBase::FromDIP(20, this));
+        sizer->AddSpacer(wxWindowBase::FromDIP(10, this));
 
         SetSizerAndFit(sizer);
         CentreOnParent();
@@ -13543,7 +14100,6 @@ public:
 
         m_timer = new wxTimer(this);
         Bind(wxEVT_TIMER, &HelioSyncProgressDialog::OnTimer, this);
-        m_start_time = std::chrono::steady_clock::now();
         m_timer->Start(500);
     }
 
@@ -13555,17 +14111,36 @@ public:
     }
 
     void on_dpi_changed(const wxRect& suggested_rect) override {}
+    bool was_cancelled_by_user() const { return m_cancelled_by_user; }
+
 
 private:
+    void OnCancel(wxCommandEvent&) {
+        m_cancelled_by_user = true;
+        if (m_timer) {
+            m_timer->Stop();
+        }
+        EndModal(wxID_CANCEL);
+    }
+
     void OnTimer(wxTimerEvent&) {
         m_gauge->Pulse();
-        if (HelioQuery::global_printers_fully_loaded && HelioQuery::global_materials_fully_loaded) {
+        const auto support_data = HelioQuery::supported_data_view();
+
+        if (m_wait_for_refresh_completion) {
+            if (support_data.printers_state != SupportDataLoadState::Loading &&
+                support_data.materials_state != SupportDataLoadState::Loading) {
+                const bool refresh_succeeded = support_data.printers_state == SupportDataLoadState::Ready &&
+                                               support_data.materials_state == SupportDataLoadState::Ready;
+                EndModal(refresh_succeeded ? wxID_OK : wxID_CANCEL);
+            }
+            return;
+        }
+        if (support_data.availability == SupportDataAvailability::Usable) {
             EndModal(wxID_OK);
             return;
         }
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - m_start_time).count();
-        if (elapsed >= 15) {
+        if (support_data.availability == SupportDataAvailability::LoadFailed) {
             EndModal(wxID_CANCEL);
             return;
         }
@@ -13573,14 +14148,68 @@ private:
 
     wxTimer* m_timer;
     wxGauge* m_gauge;
-    std::chrono::steady_clock::time_point m_start_time;
+    Button* m_cancel_btn;
+    bool m_wait_for_refresh_completion{false};
+    bool m_cancelled_by_user{false};
+
 };
+
+static std::string helio_support_data_error_details(const SupportDataCatalogPairView& support_data)
+{
+    std::string details = support_data.printers_last_error;
+    const std::string material_error = support_data.materials_last_error;
+    if (!material_error.empty()) {
+        if (!details.empty()) details += "\n";
+        details += material_error;
+    }
+    return details;
+}
+
+static bool refresh_helio_supported_data(wxWindow* parent)
+{
+    wxGetApp().request_helio_supported_data(true);
+    HelioSyncProgressDialog sync_dlg(parent, true);
+    if (sync_dlg.ShowModal() == wxID_OK) {
+        return true;
+    }
+    if (sync_dlg.was_cancelled_by_user()) {
+        return false;
+    }
+
+
+    const auto support_data = HelioQuery::supported_data_view();
+    wxString message = support_data.availability == SupportDataAvailability::Usable
+        ? _L("Helio could not refresh all printer and material data. The previous complete data remains available.")
+        : _L("Helio could not load complete printer and material data. Matching remains paused.");
+    const std::string details = helio_support_data_error_details(support_data);
+    if (!details.empty()) {
+        message += "\n\n";
+        message += wxString::FromUTF8(details);
+    }
+    MessageDialog failure_dialog(parent, message, _L("Helio Data Refresh Failed"), wxOK | wxICON_ERROR);
+    failure_dialog.ShowModal();
+    return false;
+}
 
 // ===========================================================================
 // V2 PATH: Single material_id, uses HelioMixedFilamentDialog for mixed types
 // Used when helio_multimaterial_enabled feature flag is OFF
 // ===========================================================================
+static constexpr int HELIO_SUPPORT_DATA_REFRESHED = -2;
+
 int Plater::priv::update_helio_background_process_v2(std::string& printer_id, std::string& material_id)
+{
+    for (;;) {
+        const int result = update_helio_background_process_v2_once(printer_id, material_id);
+        if (result != HELIO_SUPPORT_DATA_REFRESHED) {
+            return result;
+        }
+        printer_id.clear();
+        material_id.clear();
+    }
+}
+
+int Plater::priv::update_helio_background_process_v2_once(std::string& printer_id, std::string& material_id)
 {
     helio_using_reference_material = false; // Reset at start (Issue D fix)
 
@@ -13597,8 +14226,17 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
          return -1;
      }
 
+    const auto support_data = HelioQuery::supported_data_view();
+    const auto& supported_printers = support_data.printers;
+    const auto& supported_materials = support_data.materials;
+    if (support_data.availability != SupportDataAvailability::Usable ||
+        !supported_printers || !supported_materials) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Helio support-data snapshot is unavailable";
+        return -1;
+    }
+
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": preset_name = '" << preset_name << "', preset_pure_name = '" << preset_pure_name << "'";
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": global_supported_printers.size() = " << HelioQuery::global_supported_printers.size();
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": supported_printers.size() = " << supported_printers->size();
 
     std::string printer_target_name = preset_name;
     boost::trim(printer_target_name);
@@ -13614,7 +14252,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
 
     // Step 1: Try word-boundary matching
     auto [best_match_id, best_match_length] = match_printer_with_boundaries(
-        printer_target_name, HelioQuery::global_supported_printers);
+        printer_target_name, *supported_printers);
 
     if (!best_match_id.empty()) {
         helio_support = true;
@@ -13625,7 +14263,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
     // Step 2: Token-based matching
     if (!helio_support) {
         auto [token_printer_id, token_native_name] = match_printer_tokens(
-            printer_target_name, HelioQuery::global_supported_printers);
+            printer_target_name, *supported_printers);
 
         if (!token_printer_id.empty()) {
             wxString message = wxString::Format(
@@ -13648,7 +14286,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
     // Step 3: Reference printer selection dialog
     if (!helio_support) {
         std::vector<std::string> keywords = extract_printer_keywords(printer_target_name);
-        std::vector<HelioQuery::SupportedData> similar_printers = find_similar_printers(printer_target_name, keywords);
+        std::vector<HelioQuery::SupportedData> similar_printers = find_similar_printers(support_data, printer_target_name, keywords);
 
         if (!similar_printers.empty()) {
             wxArrayString printer_choices;
@@ -13702,7 +14340,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
     for (size_t i = 0; i < extruders.size(); ++i) {
         int extruder_idx = extruders[i] - 1;
         if (extruder_idx >= 0 && extruder_idx < (int)preset_filaments.size()) {
-            FilamentSupportInfo info = check_filament_helio_support(preset_filaments[extruder_idx], extruder_idx);
+            FilamentSupportInfo info = check_filament_helio_support(support_data, preset_filaments[extruder_idx], extruder_idx);
             all_filament_infos.push_back(info);
 
             if (info.is_supported) {
@@ -13757,7 +14395,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
         boost::trim(target_name);
 
         std::vector<std::string> keywords = extract_material_keywords(target_name);
-        std::vector<HelioQuery::SupportedData> similar_materials = find_similar_materials(target_name, keywords);
+        std::vector<HelioQuery::SupportedData> similar_materials = find_similar_materials(support_data, target_name, keywords);
 
         std::string default_material_id;
         for (const auto& info : all_filament_infos) {
@@ -13778,6 +14416,9 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
                 material_id = unsupported_dialog.get_selected_material_id();
                 helio_using_reference_material = true;
                 material_already_selected = true;
+            } else if (choice == 3 && refresh_helio_supported_data(
+                           static_cast<wxWindow*>(wxGetApp().mainframe))) {
+                return HELIO_SUPPORT_DATA_REFRESHED;
             } else {
                 return -1;
             }
@@ -13798,7 +14439,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
         size_t best_mat_match_length = 0;
         std::string best_mat_id;
 
-        for (HelioQuery::SupportedData pdata : HelioQuery::global_supported_materials) {
+        for (const HelioQuery::SupportedData& pdata : *supported_materials) {
             if (!pdata.native_name.empty()) {
                 std::string native_name = pdata.native_name;
                 size_t atPos = used_filament.find('@');
@@ -13841,7 +14482,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
             std::string best_token_material_id;
             std::string best_token_native_name;
 
-            for (HelioQuery::SupportedData pdata : HelioQuery::global_supported_materials) {
+            for (const HelioQuery::SupportedData& pdata : *supported_materials) {
                 if (!pdata.native_name.empty()) {
                     std::string native_name = pdata.native_name;
                     boost::algorithm::to_lower(native_name);
@@ -13899,7 +14540,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
                 boost::trim(target_name2);
 
                 std::vector<std::string> keywords = extract_material_keywords(target_name2);
-                std::vector<HelioQuery::SupportedData> similar_materials = find_similar_materials(target_name2, keywords);
+                std::vector<HelioQuery::SupportedData> similar_materials = find_similar_materials(support_data, target_name2, keywords);
 
                 if (!similar_materials.empty()) {
                     wxArrayString material_choices;
@@ -13912,7 +14553,7 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
                     // Collect unsupported filament info for dialog
                     std::vector<FilamentSupportInfo> unsupported_for_dialog;
                     unsupported_for_dialog.push_back(all_filament_infos.empty() ?
-                        check_filament_helio_support(used_filament, extruders.front() - 1) :
+                        check_filament_helio_support(support_data, used_filament, extruders.front() - 1) :
                         all_filament_infos[0]);
 
                     std::string default_mat_id;
@@ -13930,6 +14571,9 @@ int Plater::priv::update_helio_background_process_v2(std::string& printer_id, st
                         material_id = unsupported_dialog.get_selected_material_id();
                         is_supported_by_helio = true;
                         helio_using_reference_material = true;
+                    } else if (choice == 3 && refresh_helio_supported_data(
+                                   static_cast<wxWindow*>(wxGetApp().mainframe))) {
+                        return HELIO_SUPPORT_DATA_REFRESHED;
                     } else {
                         GUI::MessageDialog errordialog(nullptr,
                             wxString::Format(_L("Helio does not support materials %s.\n\nPlease choose an officially supported material. "), used_filament),
@@ -13989,6 +14633,23 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
                                                    std::vector<HelioQuery::MaterialInput>& materials,
                                                    bool& is_multi_color, bool& is_multi_material)
 {
+    for (;;) {
+        const int result = update_helio_background_process_once(printer_id, materials,
+                                                                 is_multi_color, is_multi_material);
+        if (result != HELIO_SUPPORT_DATA_REFRESHED) {
+            return result;
+        }
+        printer_id.clear();
+        materials.clear();
+        is_multi_color = false;
+        is_multi_material = false;
+    }
+}
+
+int Plater::priv::update_helio_background_process_once(std::string& printer_id,
+                                                        std::vector<HelioQuery::MaterialInput>& materials,
+                                                        bool& is_multi_color, bool& is_multi_material)
+{
     helio_using_reference_material = false; // Reset at start (Issue D fix)
     notification_manager->close_notification_of_type(NotificationType::HelioSlicingError);
     PresetBundle *           preset_bundle     = wxGetApp().preset_bundle;
@@ -14003,9 +14664,18 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
          return -1;
      }
 
+    const auto support_data = HelioQuery::supported_data_view();
+    const auto& supported_printers = support_data.printers;
+    const auto& supported_materials = support_data.materials;
+    if (support_data.availability != SupportDataAvailability::Usable ||
+        !supported_printers || !supported_materials) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Helio support-data snapshot is unavailable";
+        return -1;
+    }
+
     /*invalid printer preset*/
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": preset_name = '" << preset_name << "', preset_pure_name = '" << preset_pure_name << "'";
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": global_supported_printers.size() = " << HelioQuery::global_supported_printers.size();
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": supported_printers.size() = " << supported_printers->size();
 
     // For printer matching, use the full preset_name to handle modified names like "myBambu Lab H2Dsmells"
     std::string printer_target_name = preset_name;
@@ -14024,7 +14694,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
     // This finds the best (longest) match to prefer specific printers over generic ones
     // e.g., "H2D Pro" should match before "H2D" when both could match
     auto [best_match_id, best_match_length] = match_printer_with_boundaries(
-        printer_target_name, HelioQuery::global_supported_printers);
+        printer_target_name, *supported_printers);
 
     if (!best_match_id.empty()) {
         helio_support = true;
@@ -14036,7 +14706,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
     // This handles cases like "myBambu Lab H2Dsmells" or "yourH2Dfast"
     if (!helio_support) {
         auto [token_printer_id, token_native_name] = match_printer_tokens(
-            printer_target_name, HelioQuery::global_supported_printers);
+            printer_target_name, *supported_printers);
 
         if (!token_printer_id.empty()) {
             // Show confirmation dialog for token-based match
@@ -14065,7 +14735,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
 
         // Extract keywords and find similar printers
         std::vector<std::string> keywords = extract_printer_keywords(printer_target_name);
-        std::vector<HelioQuery::SupportedData> similar_printers = find_similar_printers(printer_target_name, keywords);
+        std::vector<HelioQuery::SupportedData> similar_printers = find_similar_printers(support_data, printer_target_name, keywords);
 
         if (!similar_printers.empty()) {
             // Create list of printer names for selection dialog
@@ -14336,7 +15006,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
     for (size_t i = 0; i < extruders.size(); ++i) {
         int extruder_idx = extruders[i] - 1; // Extruders are 1-indexed
         if (extruder_idx >= 0 && extruder_idx < (int)preset_filaments.size()) {
-            FilamentSupportInfo info = check_filament_helio_support(preset_filaments[extruder_idx], extruder_idx);
+            FilamentSupportInfo info = check_filament_helio_support(support_data, preset_filaments[extruder_idx], extruder_idx);
             all_filament_infos.push_back(info);
 
             if (info.is_supported) {
@@ -14411,7 +15081,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
         std::string best_token_material_id;
         std::string best_token_native_name;
 
-        for (const HelioQuery::SupportedData& pdata : HelioQuery::global_supported_materials) {
+        for (const HelioQuery::SupportedData& pdata : *supported_materials) {
             if (pdata.native_name.empty()) continue;
             std::string native_name = pdata.native_name;
             boost::algorithm::to_lower(native_name);
@@ -14460,7 +15130,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
 
         // No token match — show reference material selection dialog
         std::vector<std::string> keywords = extract_material_keywords(target_name);
-        std::vector<HelioQuery::SupportedData> similar_materials = find_similar_materials(target_name, keywords);
+        std::vector<HelioQuery::SupportedData> similar_materials = find_similar_materials(support_data, target_name, keywords);
 
         if (!similar_materials.empty()) {
             wxArrayString material_choices;
@@ -14482,7 +15152,7 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
 
             int choice = 0;
             std::string selected_ref_material_id;
-            do {
+            {
                 HelioUnsupportedFilamentsDialog unsupported_dialog(
                     static_cast<wxWindow*>(wxGetApp().mainframe),
                     unsupported_for_slot, similar_materials, default_material_id);
@@ -14494,23 +15164,12 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
                 if (choice == 3) {
                     // Re-fetch supported data from Helio
                     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": User chose to refresh supported data for slot " << i;
-                    std::string helio_api_url = HelioQuery::get_helio_api_url();
-                    std::string helio_api_key = HelioQuery::get_helio_pat();
-                    HelioQuery::request_all_support_machine(helio_api_url, helio_api_key);
-                    HelioQuery::request_all_support_materials(helio_api_url, helio_api_key);
-
-                    // Show progress dialog while data syncs
-                    HelioSyncProgressDialog sync_dlg(static_cast<wxWindow*>(wxGetApp().mainframe));
-                    sync_dlg.ShowModal();
-
-                    // Re-compute similar materials with refreshed data
-                    similar_materials = find_similar_materials(target_name, keywords);
-                    if (similar_materials.empty()) {
-                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": No similar materials found after refresh for slot " << i;
-                        break;
+                    if (!refresh_helio_supported_data(static_cast<wxWindow*>(wxGetApp().mainframe))) {
+                        return -1;
                     }
+                    return HELIO_SUPPORT_DATA_REFRESHED;
                 }
-            } while (choice == 3);
+            }
 
             if (choice == 1) {
                 materials[i].materialId = selected_ref_material_id;
@@ -14574,6 +15233,9 @@ int Plater::priv::update_helio_background_process(std::string& printer_id,
 
 void Plater::priv::on_helio_processing_complete(HelioCompletionEvent &a)
 {
+    if (!helio_background_process.is_action_current(a.generation)) {
+        return;
+    }
     if (a.is_successful) {
         this->reset_gcode_toolpaths();
 
@@ -14652,8 +15314,11 @@ void Plater::priv::on_helio_processing_complete(HelioCompletionEvent &a)
     }
 }
 
-void Plater::priv::on_helio_processing_start(SimpleEvent &a)
+void Plater::priv::on_helio_processing_start(HelioActionEvent &a)
 {
+    if (!helio_background_process.is_action_current(a.generation)) {
+        return;
+    }
     notification_manager->close_notification_of_type(GUI::NotificationType::SignDetected);
     notification_manager->close_notification_of_type(GUI::NotificationType::ExportFinished);
     notification_manager->set_slicing_progress_began(true);
@@ -14661,8 +15326,20 @@ void Plater::priv::on_helio_processing_start(SimpleEvent &a)
 }
 
 //BBS: GUI refactor: slice with helio
-void Plater::priv::on_helio_process()
+void Plater::priv::on_helio_process(const PartPlate* expected_plate)
 {
+    auto helio_launch_allowed = [this, expected_plate]() {
+        const PartPlate* current_plate = partplate_list.get_curr_plate();
+        return current_plate != nullptr && current_plate == expected_plate &&
+               current_plate->is_slice_result_valid() && current_plate->can_slice() &&
+               !q->only_gcode_mode() && !q->using_exported_file() &&
+               !sidebar->has_broken_mixed_filament(current_plate) &&
+               !q->is_background_process_slicing();
+    };
+
+    if (!helio_launch_allowed())
+        return;
+
     std::string helio_api_url = Slic3r::HelioQuery::get_helio_api_url();
     std::string helio_api_key = Slic3r::HelioQuery::get_helio_pat();
 
@@ -14712,25 +15389,40 @@ void Plater::priv::on_helio_process()
 
         while (dlg.ShowModal() == wxID_OK)
         {
+            if (!helio_launch_allowed())
+                return;
+
             if (partplate_list.get_curr_plate()->empty()) return;
             GCodeProcessorResult* g_result = background_process.get_current_gcode_result();
 
             /*simulation*/
             int action = dlg.get_action();
-            helio_background_process.set_action(action);
 
             if (action == 0) {
                 bool valid = false;
                 HelioQuery::SimulationInput data = dlg.get_simulation_input(valid);
                 if (!valid) { continue; }
 
-                helio_background_process.set_simulation_input_data(data);
-                if (multimaterial_enabled) {
-                    helio_background_process.init(helio_api_key, helio_api_url, printer_id, materials, is_multi_color, is_multi_material, g_result, preview, [this]() {});
-                } else {
-                    helio_background_process.init(helio_api_key, helio_api_url, printer_id, material_id, g_result, preview, [this]() {});
+                const bool initialized = multimaterial_enabled
+                    ? helio_background_process.init(helio_api_key, helio_api_url, printer_id, materials, is_multi_color,
+                                                    is_multi_material, g_result, preview, [this]() {})
+                    : helio_background_process.init(helio_api_key, helio_api_url, printer_id, material_id, g_result,
+                                                    preview, [this]() {});
+                if (!initialized) {
+                    MessageDialog dlg(nullptr, _L("Previous Helio action is still stopping; try again shortly"),
+                                      _L("Helio Additive"), wxOK | wxICON_WARNING);
+                    dlg.ShowModal();
+                    continue;
                 }
-                helio_background_process.helio_thread_start(background_process.m_mutex, background_process.m_condition, background_process.m_state, notification_manager);
+                helio_background_process.set_action(action);
+                helio_background_process.set_simulation_input_data(data);
+                if (!helio_background_process.helio_thread_start(background_process.m_mutex, background_process.m_condition,
+                                                                 background_process.m_state, notification_manager)) {
+                    MessageDialog dlg(nullptr, _L("Previous Helio action is still stopping; try again shortly"),
+                                      _L("Helio Additive"), wxOK | wxICON_WARNING);
+                    dlg.ShowModal();
+                    continue;
+                }
                 BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":helio simulation process called (V" << (multimaterial_enabled ? "3" : "2") << ")";
 
                 if (wxGetApp().getAgent()) {
@@ -14746,13 +15438,26 @@ void Plater::priv::on_helio_process()
                 HelioQuery::OptimizationInput data = dlg.get_optimization_input(valid);
                 if (!valid) { continue; }
 
-                helio_background_process.set_optimization_input_data(data);
-                if (multimaterial_enabled) {
-                    helio_background_process.init(helio_api_key, helio_api_url, printer_id, materials, is_multi_color, is_multi_material, g_result, preview, [this]() {});
-                } else {
-                    helio_background_process.init(helio_api_key, helio_api_url, printer_id, material_id, g_result, preview, [this]() {});
+                const bool initialized = multimaterial_enabled
+                    ? helio_background_process.init(helio_api_key, helio_api_url, printer_id, materials, is_multi_color,
+                                                    is_multi_material, g_result, preview, [this]() {})
+                    : helio_background_process.init(helio_api_key, helio_api_url, printer_id, material_id, g_result,
+                                                    preview, [this]() {});
+                if (!initialized) {
+                    MessageDialog dlg(nullptr, _L("Previous Helio action is still stopping; try again shortly"),
+                                      _L("Helio Additive"), wxOK | wxICON_WARNING);
+                    dlg.ShowModal();
+                    continue;
                 }
-                helio_background_process.helio_thread_start(background_process.m_mutex, background_process.m_condition, background_process.m_state, notification_manager);
+                helio_background_process.set_action(action);
+                helio_background_process.set_optimization_input_data(data);
+                if (!helio_background_process.helio_thread_start(background_process.m_mutex, background_process.m_condition,
+                                                                 background_process.m_state, notification_manager)) {
+                    MessageDialog dlg(nullptr, _L("Previous Helio action is still stopping; try again shortly"),
+                                      _L("Helio Additive"), wxOK | wxICON_WARNING);
+                    dlg.ShowModal();
+                    continue;
+                }
                 BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":helio optimization process called (V" << (multimaterial_enabled ? "3" : "2") << ")";
 
                 if (wxGetApp().getAgent()) {
@@ -14770,6 +15475,12 @@ void Plater::priv::on_helio_process()
 
 void Plater::priv::on_helio_input_dlg(SimpleEvent &a)
 {
+    const PartPlate* current_plate = partplate_list.get_curr_plate();
+    if (current_plate == nullptr || !current_plate->is_slice_result_valid() ||
+        !current_plate->can_slice() || q->only_gcode_mode() || q->using_exported_file() ||
+        sidebar->has_broken_mixed_filament(current_plate) || q->is_background_process_slicing())
+        return;
+
     std::string helio_api_key = Slic3r::HelioQuery::get_helio_pat();
 
     if (helio_api_key.empty()) {
@@ -14801,22 +15512,46 @@ void Plater::priv::on_helio_input_dlg(SimpleEvent &a)
         }
     }
     else {
-        if (!HelioQuery::global_printers_fully_loaded || !HelioQuery::global_materials_fully_loaded) {
+        const SupportDataAvailability availability = HelioQuery::supported_data_view().availability;
+        if (availability == SupportDataAvailability::Usable) {
+            on_helio_process(current_plate);
+        }
+        else if (availability == SupportDataAvailability::Synchronizing) {
             wxGetApp().request_helio_supported_data();
             auto dlg = MessageDialog(nullptr, _L("The printer list and material list are being synchronized. Please try again later."), _L("Synchronizing Helio"), wxOK | wxICON_WARNING);
             dlg.ShowModal();
         }
         else {
-            on_helio_process();
+                const std::string details = helio_support_data_error_details(HelioQuery::supported_data_view());
+
+                wxString message = _L("Helio could not load the supported printer and material lists. Matching has been paused so unavailable data is not treated as an unsupported material.");
+                if (!details.empty()) {
+                    message += "\n\n";
+                    message += wxString::FromUTF8(details);
+                }
+                MessageDialog dlg(nullptr, message, _L("Helio Data Load Failed"), wxYES_NO | wxNO_DEFAULT | wxICON_ERROR);
+                dlg.SetButtonLabel(wxID_YES, _L("Retry"));
+                dlg.SetButtonLabel(wxID_NO, _L("Cancel"));
+                if (dlg.ShowModal() != wxID_YES) {
+                    return;
+                }
+
+                wxGetApp().request_helio_supported_data(true);
+                HelioSyncProgressDialog sync_dlg(static_cast<wxWindow*>(wxGetApp().mainframe), true);
+                sync_dlg.ShowModal();
+                if (HelioQuery::supported_data_view().availability == SupportDataAvailability::Usable) {
+                    on_helio_process(current_plate);
+                    return;
+                }
+            }
         }
     }
-}
 
 //BBS: GUI refactor: slice all
 void Plater::priv::on_action_slice_all(SimpleEvent&)
 {
     if (q != nullptr) {
-        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice project event\n" ;
+        BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received slice project event\n";
         //BBS update extruder params and speed table before slicing
         const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
         auto& print = q->get_partplate_list().get_current_fff_print();
@@ -14885,6 +15620,8 @@ void Plater::priv::on_action_print_plate(SimpleEvent&)
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print plate event\n" ;
     }
+
+    if (!wxGetApp().check_send_print_version_policy()) return;
 
     //BBS
     if (!m_select_machine_dlg) m_select_machine_dlg = new SelectMachineDialog(q);
@@ -14955,6 +15692,8 @@ void Plater::priv::on_action_print_plate_from_sdcard(SimpleEvent&)
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print plate event\n";
     }
 
+    if (!wxGetApp().check_send_print_version_policy()) return;
+
     //BBS
     if (!m_select_machine_dlg) m_select_machine_dlg = new SelectMachineDialog(q);
     m_select_machine_dlg->set_print_type(PrintFromType::FROM_SDCARD_VIEW);
@@ -14978,6 +15717,8 @@ int Plater::priv::update_print_required_data(Slic3r::DynamicPrintConfig config, 
 
 void Plater::priv::on_action_send_to_printer(bool isall)
 {
+    if (!wxGetApp().check_send_print_version_policy()) return;
+
 	if (!m_send_to_sdcard_dlg) m_send_to_sdcard_dlg = new SendToPrinterDialog(q);
     if (isall) {
         m_send_to_sdcard_dlg->prepare(PLATE_ALL_IDX);
@@ -15003,6 +15744,8 @@ void Plater::priv::on_action_print_all(SimpleEvent&)
     if (q != nullptr) {
         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << ":received print all event\n" ;
     }
+
+    if (!wxGetApp().check_send_print_version_policy()) return;
 
     //BBS
     if (!m_select_machine_dlg) m_select_machine_dlg = new SelectMachineDialog(q);
@@ -15613,9 +16356,20 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
     old_plate_bbox_list.reserve(old_plate_list.get_plate_count());
     std::vector<BoundingBoxf3> old_plate_wt_bbox; // per-plate wipe tower bbox; .defined=false when absent
     old_plate_wt_bbox.reserve(old_plate_list.get_plate_count());
+    // Snapshot of old plate's filament count; new plate's AMS association
+    // isn't settled yet right after select_prest(), so reuse this instead.
+    std::vector<int> old_plate_filament_cnt;
+    old_plate_filament_cnt.reserve(old_plate_list.get_plate_count());
     const DynamicPrintConfig &old_full_config         = wxGetApp().preset_bundle->full_config();
     const int                 old_nozzle_nums         = wxGetApp().preset_bundle->get_printer_extruder_count();
     const bool                old_prime_tower_enabled = old_full_config.opt_bool("enable_prime_tower");
+    // Smooth-mode timelapse needs a wipe tower even for a single-filament plate, so it
+    // must gate the snapshot/translate logic the same way filament_cnt>1 does.
+    const auto old_timelapse_smooth = []() -> bool {
+        if (auto *opt = wxGetApp().preset_bundle->full_config().option<ConfigOptionEnum<TimelapseType>>("timelapse_type"))
+            return opt->value == TimelapseType::tlSmooth;
+        return false;
+    }();
     for (size_t i = 0; i < old_plate_list.get_plate_count(); ++i) {
         PartPlate                    *plate   = old_plate_list.get_plate(i);
         std::set<std::pair<int, int>> obj_set = plate->get_obj_and_inst_set();
@@ -15631,14 +16385,20 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
 
         BoundingBoxf3 wt_bbox; // default-constructed: defined=false
         const int     filament_cnt = static_cast<int>(plate->get_extruders().size());
-        // Wipe tower contributes only when prime tower is on and the plate has >1 filament.
-        if (old_prime_tower_enabled && filament_cnt > 1) {
+        old_plate_filament_cnt.emplace_back(filament_cnt);
+        // Wipe tower contributes when prime tower is on and (plate has >1 filament
+        // OR smooth-mode timelapse, which needs a tower even for a single filament).
+        if (old_prime_tower_enabled && (filament_cnt > 1 || old_timelapse_smooth)) {
             Vec3d wt_pos, wt_size;
             plate->estimate_wipe_tower_polygon(old_full_config, static_cast<int>(i),
                                                wt_pos, wt_size, old_nozzle_nums, filament_cnt);
             if (wt_size.x() > 1e-3 && wt_size.y() > 1e-3) {
+                // Anchor from raw wipe_tower_x/y; wt_pos from estimate_wipe_tower_polygon
+                // includes brim clamp and would skew the pre-switch snapshot.
                 const Vec3d plate_origin = plate->get_origin();
-                const Vec3d wt_min       = plate_origin + Vec3d(wt_pos.x(), wt_pos.y(), 0.0);
+                const double raw_x        = old_full_config.option<ConfigOptionFloats>("wipe_tower_x")->get_at((int) i);
+                const double raw_y        = old_full_config.option<ConfigOptionFloats>("wipe_tower_y")->get_at((int) i);
+                const Vec3d  wt_min       = plate_origin + Vec3d(raw_x, raw_y, 0.0);
                 wt_bbox = BoundingBoxf3(wt_min, wt_min + wt_size);
             }
         }
@@ -15765,6 +16525,18 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
     const int                         new_plate_count = cur_plate_list.get_plate_count();
     const int                         common_count    = std::min(static_cast<int>(plate_object.size()), new_plate_count);
 
+    // Fit / reschedule decision must use the NEW printer's wipe-tower footprint, not
+    // the pre-switch snapshot size (e.g. large-plate tower size when switching back
+    // to a small plate would falsely trigger a full re-arrange)
+    const DynamicPrintConfig &new_full_config_for_wt = wxGetApp().preset_bundle->full_config();
+    const int new_nozzle_nums = wxGetApp().preset_bundle->get_printer_extruder_count();
+    const bool new_prime_tower_enabled = new_full_config_for_wt.opt_bool("enable_prime_tower");
+    const bool new_timelapse_smooth = []() -> bool {
+        if (auto *opt = wxGetApp().preset_bundle->full_config().option<ConfigOptionEnum<TimelapseType>>("timelapse_type"))
+            return opt->value == TimelapseType::tlSmooth;
+        return false;
+    }();
+
     for (int i = 0; i < static_cast<int>(plate_object.size()); ++i) {
         std::vector<int> effective_objs;
         effective_objs.reserve(plate_object[i].size());
@@ -15789,11 +16561,31 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
                 continue;
             content_bbox.merge(mo->instance_bounding_box(0));
         }
-        if (i < static_cast<int>(old_plate_wt_bbox.size()) && old_plate_wt_bbox[i].defined)
-            content_bbox.merge(old_plate_wt_bbox[i]);
 
-        PartPlate  *new_plate    = cur_plate_list.get_plate(i);
+        // Merge footprint at the pre-switch anchor with the NEW printer's tower size.
+        // filament_cnt comes from the OLD-plate snapshot since new_plate's isn't settled yet.
+        PartPlate *new_plate = cur_plate_list.get_plate(i);
+        if (i < static_cast<int>(old_plate_wt_bbox.size()) && old_plate_wt_bbox[i].defined) {
+            const BoundingBoxf3 &old_wt  = old_plate_wt_bbox[i];
+            Vec3d new_wt_size = Vec3d::Zero();
+            const int filament_cnt = old_plate_filament_cnt[i];
+            if (new_prime_tower_enabled && (filament_cnt > 1 || new_timelapse_smooth)){
+                Vec3d new_wt_pos_unused;
+                // use_global_objects=true: per-plate containment isn't reliable yet here,
+                // so scan all objects instead.
+                new_plate->estimate_wipe_tower_polygon(new_full_config_for_wt, static_cast<int>(i),
+                                                        new_wt_pos_unused, new_wt_size,
+                                                        new_nozzle_nums, filament_cnt, /*use_global_objects=*/true);
+            }
+            content_bbox.merge(BoundingBoxf3(old_wt.min, old_wt.min + new_wt_size));
+        }
+
+
         const Vec3d new_plate_sz = new_plate->get_bounding_box().size();
+        const Vec3d old_plate_sz = old_plate_bbox_list[i].size();
+        const double plate_size_eps = 0.1;
+        const bool  same_plate_size = std::abs(new_plate_sz.x() - old_plate_sz.x()) <= plate_size_eps
+                                    && std::abs(new_plate_sz.y() - old_plate_sz.y()) <= plate_size_eps;
         const Vec3d content_dim  = content_bbox.size();
         const bool  xy_over      = content_dim.x() > new_plate_sz.x() + xy_overflow_eps
                                 || content_dim.y() > new_plate_sz.y() + xy_overflow_eps;
@@ -15801,8 +16593,11 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
             for (int o : effective_objs)
                 reschedule_set.insert(o);
         } else {
+            // Same plate size -> delta ends up ~zero, but still go through this
+            // path so the wipe tower position write below always runs.
+            const Vec3d pass_center = same_plate_size ? old_plate_bbox_list[i].center() : content_bbox.center();
             // Defer delta until create_plate has settled the final grid.
-            pass_translations.push_back({ i, std::move(effective_objs), content_bbox.center() });
+            pass_translations.push_back({i, std::move(effective_objs), pass_center});
         }
     }
 
@@ -15924,36 +16719,102 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
         DynamicConfig      &proj_cfg     = wxGetApp().preset_bundle->project_config;
         ConfigOptionFloats *wipe_tower_x = proj_cfg.opt<ConfigOptionFloats>("wipe_tower_x");
         ConfigOptionFloats *wipe_tower_y = proj_cfg.opt<ConfigOptionFloats>("wipe_tower_y");
+
         for (const auto &pt : pass_translations) {
             if (pt.plate_idx < 0 || pt.plate_idx >= final_plate_count)
                 continue;
-            PartPlate  *new_plate        = cur_plate_list.get_plate(pt.plate_idx);
+            PartPlate *new_plate = cur_plate_list.get_plate(pt.plate_idx);
             const Vec3d new_plate_center = new_plate->get_center_origin();
-            const Vec3d delta(new_plate_center.x() - pt.content_center.x(),
-                              new_plate_center.y() - pt.content_center.y(),
-                              0.0);
-            if (delta.cwiseAbs().maxCoeff() <= 1e-6)
-                continue;
-            for (int obj_idx : pt.effective_objs) {
-                if (obj_idx < 0 || obj_idx >= static_cast<int>(model.objects.size()))
-                    continue;
-                ModelObject *o = model.objects[obj_idx];
-                if (!o || o->instances.empty())
-                    continue;
-                ModelInstance *inst = o->instances[0];
-                inst->set_offset(inst->get_offset() + delta);
-                o->invalidate_bounding_box();
+            const Vec3d delta(new_plate_center.x() - pt.content_center.x(), new_plate_center.y() - pt.content_center.y(), 0.0);
+            if(delta.cwiseAbs().maxCoeff() > 1e-6) {
+                for (int obj_idx : pt.effective_objs) {
+                    if (obj_idx < 0 || obj_idx >= static_cast<int>(model.objects.size())) continue;
+                    ModelObject *o = model.objects[obj_idx];
+                    if (!o || o->instances.empty()) continue;
+                    ModelInstance *inst = o->instances[0];
+                    inst->set_offset(inst->get_offset() + delta);
+                    o->invalidate_bounding_box();
+                }
             }
 
-            if (pt.plate_idx < static_cast<int>(old_plate_wt_bbox.size())
-                && old_plate_wt_bbox[pt.plate_idx].defined
-                && wipe_tower_x && wipe_tower_y
-                && pt.plate_idx < static_cast<int>(wipe_tower_x->values.size())
-                && pt.plate_idx < static_cast<int>(wipe_tower_y->values.size())) {
-                const Vec3d new_plate_origin = new_plate->get_origin();
-                const Vec3d new_wt_world_min = old_plate_wt_bbox[pt.plate_idx].min + delta;
-                wipe_tower_x->values[pt.plate_idx] = new_wt_world_min.x() - new_plate_origin.x();
-                wipe_tower_y->values[pt.plate_idx] = new_wt_world_min.y() - new_plate_origin.y();
+            const bool has_tower_snapshot =
+                    pt.plate_idx < static_cast<int>(old_plate_wt_bbox.size()) && old_plate_wt_bbox[pt.plate_idx].defined
+                    && wipe_tower_x && wipe_tower_y && pt.plate_idx < static_cast<int>(wipe_tower_x->values.size()) &&
+                    pt.plate_idx < static_cast<int>(wipe_tower_y->values.size());
+
+            // Always (re)write the tower position: set_default_wipe_tower_pos_for_plate()
+            // unconditionally reset wipe_tower_x/y earlier, so it must be re-derived here.
+            if(has_tower_snapshot){
+                const BoundingBoxf3 &old_wt = old_plate_wt_bbox[pt.plate_idx];
+
+                Vec3d new_wt_size = old_wt.max - old_wt.min;
+                const int filament_cnt = old_plate_filament_cnt[pt.plate_idx];
+                if (new_prime_tower_enabled && (filament_cnt > 1 || new_timelapse_smooth)) {
+                    Vec3d new_wt_pos_unused;
+                    new_plate->estimate_wipe_tower_polygon(new_full_config_for_wt, pt.plate_idx, new_wt_pos_unused, new_wt_size,
+                                                            new_nozzle_nums, filament_cnt, /*use_global_objects=*/true);
+                }
+
+                // Anchor by the bottom-left (min) corner: it rides the content delta,
+                // and the new size grows/shrinks from that fixed corner.
+                const Vec3d new_wt_min = old_wt.min + delta;
+
+                // Clamp against get_build_volume(true), same as interactive drag, so on
+                // dual-nozzle plates the tower stays reachable by both nozzles.
+                BoundingBoxf3 plate_bb = new_plate->get_build_volume(true);
+                const float margin = WIPE_TOWER_MARGIN;
+                Vec3d clamped_wt_min = new_wt_min;
+                for (int axis = 0; axis < 2; ++axis) {
+                    double lo = plate_bb.min(axis) + margin;
+                    double hi = plate_bb.max(axis) - new_wt_size(axis) - margin;
+                    if (hi < lo) hi = lo; // tower doesn't fit even alone: pin to the low edge
+                    clamped_wt_min(axis) = std::clamp(new_wt_min(axis), lo, hi);
+                }
+                const Vec3d pull_back = clamped_wt_min - new_wt_min;
+
+                // Try applying the pull-back to objects too; keep it only if they still
+                // fit, otherwise it's tower-only so objects don't get shoved off-plate.
+                Vec3d obj_shift = Vec3d::Zero();
+                if (pull_back.cwiseAbs().maxCoeff() > 1e-6) {
+                    BoundingBoxf3 shifted_content_bbox;
+                    for (int obj_idx : pt.effective_objs) {
+                        if (obj_idx < 0 || obj_idx >= static_cast<int>(model.objects.size())) continue;
+                        ModelObject *o = model.objects[obj_idx];
+                        if (!o || o->instances.empty()) continue;
+                        BoundingBoxf3 ibb = o->instance_bounding_box(0);
+                        shifted_content_bbox.merge(BoundingBoxf3(ibb.min + pull_back, ibb.max + pull_back));
+                    }
+                    if (shifted_content_bbox.defined) {
+                        const Vec3d new_plate_sz    = new_plate->get_bounding_box().size();
+                        const Vec3d shifted_dim     = shifted_content_bbox.size();
+                        const bool  objs_would_overflow =
+                                shifted_dim.x() > new_plate_sz.x() + xy_overflow_eps
+                                || shifted_dim.y() > new_plate_sz.y() + xy_overflow_eps
+                                || shifted_content_bbox.min.x() < new_plate->get_bounding_box().min.x() - xy_overflow_eps
+                                || shifted_content_bbox.min.y() < new_plate->get_bounding_box().min.y() - xy_overflow_eps
+                                || shifted_content_bbox.max.x() > new_plate->get_bounding_box().max.x() + xy_overflow_eps
+                                || shifted_content_bbox.max.y() > new_plate->get_bounding_box().max.y() + xy_overflow_eps;
+                        if (!objs_would_overflow)
+                            obj_shift = pull_back;
+                    }
+                }
+                if (obj_shift.cwiseAbs().maxCoeff() > 1e-6) {
+                    for (int obj_idx : pt.effective_objs) {
+                        if (obj_idx < 0 || obj_idx >= static_cast<int>(model.objects.size())) continue;
+                        ModelObject *o = model.objects[obj_idx];
+                        if (!o || o->instances.empty()) continue;
+                        ModelInstance *inst = o->instances[0];
+                        inst->set_offset(inst->get_offset() + obj_shift);
+                        o->invalidate_bounding_box();
+                    }
+                }
+                const Vec3d final_wt_min = new_wt_min + pull_back;
+
+                const Vec3d new_plate_origin       = new_plate->get_origin();
+                wipe_tower_x->values[pt.plate_idx] = final_wt_min.x() - new_plate_origin.x();
+                wipe_tower_y->values[pt.plate_idx] = final_wt_min.y() - new_plate_origin.y();
+                if (pt.plate_idx < static_cast<int>(model.wipe_tower.positions.size()))
+                    model.wipe_tower.positions[pt.plate_idx] = Vec2d(wipe_tower_x->values[pt.plate_idx], wipe_tower_y->values[pt.plate_idx]);
             }
         }
 
@@ -15980,10 +16841,10 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
                 model.objects[obj_id]->invalidate_bounding_box();
         }
 
-        // 5. Park virtual-bound objects on the virtual plate, aligned by
-        //    convex-hull centre so multi-part offset origins don't spill out.
+        // 5. Park virtual-bound objects on the virtual plate, aligned by bbox
+        //    top-left corner so oversized items spill right/down, not onto other plates.
         PartPlate    &unprintable_plate = cur_plate_list.get_unprintable_plate();
-        const Vec3d   virtual_center    = unprintable_plate.get_center_origin();
+        const Vec3d   virtual_topleft   = unprintable_plate.get_topleft_origin();
         std::set<int> all_virtual       = virtual_obj_idxs;
         all_virtual.insert(arrange_unpackable.begin(), arrange_unpackable.end());
         for (int obj_idx : all_virtual) {
@@ -15992,12 +16853,11 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
             ModelObject *o = model.objects[obj_idx];
             if (!o || o->instances.empty())
                 continue;
-            ModelInstance *inst        = o->instances[0];
-            BoundingBoxf3  hull        = o->instance_convex_hull_bounding_box(static_cast<size_t>(0));
-            const Vec3d    cur_off     = inst->get_offset();
-            const Vec3d    hull_center = hull.center();
-            inst->set_offset(Vec3d(cur_off.x() + (virtual_center.x() - hull_center.x()),
-                                   cur_off.y() + (virtual_center.y() - hull_center.y()),
+            ModelInstance *inst    = o->instances[0];
+            BoundingBoxf3  hull    = o->instance_convex_hull_bounding_box(static_cast<size_t>(0));
+            const Vec3d    cur_off = inst->get_offset();
+            inst->set_offset(Vec3d(cur_off.x() + (virtual_topleft.x() - hull.min(0)),
+                                   cur_off.y() + (virtual_topleft.y() - hull.max(1)),
                                    cur_off.z()));
             o->invalidate_bounding_box();
         }
@@ -16057,6 +16917,9 @@ void Plater::priv::update_objects_position_when_select_preset(const std::functio
         update();
 
         view3D->deselect_all();
+
+        if (q)
+            q->on_plate_layout_changed();
     }
 
     // EVT_GLCANVAS_ARRANGE_OUTPLATE intentionally NOT posted: reschedule is now
@@ -16261,7 +17124,7 @@ bool Plater::priv::check_ams_status_impl(bool is_slice_all)
             } dlg(q);
             dlg.Fit();
             if (dlg.ShowModal() == wxID_YES) {
-                if (GUI::wxGetApp().sidebar().sync_extruder_list()) {
+                if (GUI::wxGetApp().sidebar().sync_extruder_list() && wxGetApp().check_slice_version_policy()) {
                     if (is_slice_all)
                         wxPostEvent(q, SimpleEvent(EVT_GLTOOLBAR_SLICE_ALL));
                     else
@@ -16637,6 +17500,16 @@ void Plater::priv::set_bed_shape(const Pointfs       &shape,
         if (shape_position != new_shape_position)
             bed.set_shape(shape, printable_height, extruder_areas, extruder_heights, custom_model, force_as_custom, new_shape_position);
     }
+
+    // Always refresh heat-soak zones from printer config (may be empty on non-A2L).
+    {
+        Pointfs heat_soak_areas;
+        if (auto *opt = config->option<ConfigOptionPoints>("bed_heat_soak_area"))
+            heat_soak_areas = opt->values;
+        partplate_list.set_heat_soak_areas(heat_soak_areas);
+        if (q)
+            q->on_plate_layout_changed();
+    }
 }
 
 bool Plater::priv::can_delete() const
@@ -16786,10 +17659,15 @@ void Plater::priv::on_action_layersediting(SimpleEvent&)
     if (!view3D->is_layers_editing_enabled()) {
         const auto& print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
         if (print_config.opt_bool("enable_mixed_color_sublayer")) {
-            MessageDialog dlg(q,
-                _L("Using variable layer height together with mixed color sublayer may result in poor color mixing quality."),
-                _L("Warning"), wxICON_WARNING | wxOK);
-            dlg.ShowModal();
+            if (wxGetApp().app_config->get("no_warn_mixed_sublayer_variable_layer") != "1") {
+                MessageDialog dlg(q,
+                    _L("Using variable layer height together with mixed color sublayer may result in poor color mixing quality."),
+                    _L("Warning"), wxICON_WARNING | wxOK);
+                dlg.show_dsa_button();
+                dlg.ShowModal();
+                if (dlg.get_checkbox_state())
+                    wxGetApp().app_config->set("no_warn_mixed_sublayer_variable_layer", "1");
+            }
         }
     }
     view3D->enable_layers_editing(!view3D->is_layers_editing_enabled());
@@ -16886,6 +17764,1081 @@ bool Plater::priv::leave_gizmos_stack()
     return changed;
 }
 
+void Plater::priv::invalidate_assemble_model_on_project_reset()
+{
+    // Drop the assembly BVH cache so ratios / bounds / notifications do not leak into the next project.
+    GLCanvas3D::clear_isolated_volumes_cache();
+    // Invalidate the independent assembly model so it is re-derived for the next project.
+    m_assemble_model.clear_objects();
+    m_assemble_model_valid = false;
+    // Drop any retained assembly undo history and force a fresh baseline for the next project.
+    m_undo_redo_stack_assemble.clear();
+    m_assemble_undo_baseline_dirty = true;
+    m_assemble_project_dirty       = false;
+    clear_assemble_guide_ui_snapshots();
+    // clear_objects() does not touch assembly steps/tree. After leaving assembly view those
+    // artifacts live on the prepare model (sync_assemble_steps_to_main_model); if they survive
+    // reset, the next homepage STEP open does derive_assemble_model() via `m_assemble_model =
+    // model` and then appends a fresh STEP seed on top — leaving an empty leftover step.
+    // new_project avoids this via model.load_from(empty); load_project only calls reset().
+    model.clear_assembly_artifacts();
+    m_assemble_model.clear_assembly_artifacts();
+}
+
+void Plater::priv::derive_assemble_model()
+{
+    // A freshly derived / restored assembly model has no matching undo history: force a clean baseline.
+    m_assemble_undo_baseline_dirty = true;
+    m_assemble_project_dirty = false;
+    // Ensure every prepare-side model part has a stable GUID before cloning, so each assembly-side
+    // counterpart can reference it through assembly_src_guid.
+    for (ModelObject *mo : model.objects)
+        for (ModelVolume *mv : mo->volumes)
+            if (mv->is_model_part())
+                mv->ensure_part_guid();
+
+    // Restore the persisted independent assembly model when the project carries one (3mf reload):
+    // rebuild the object graph from JSON and rebind meshes from the prepare model by part_guid, instead
+    // of deriving a fresh 1:1 clone. This keeps assembly-view structural state (deletes / appends / poses)
+    // across save/reload. Falls back to deriving when absent (old files) or on parse failure.
+    if (!model.get_assembly_model_json_str().empty()) {
+        std::string assembly_model_error;
+        if (assembly_model_from_json_string(model.get_assembly_model_json_str(), m_assemble_model, model, &assembly_model_error)) {
+            m_assemble_model.is_assembly_model = true; // debug marker for the assembly-view model
+            // Re-resolve the assembly tree / steps against the rebuilt assembly model so AssemblyStepsUtils
+            // (bound to m_assemble_model) sees a self-consistent typed tree (object_idx / id / name based).
+            m_assemble_model.set_assembly_tree_json_str(model.get_assembly_tree_json_str());
+            m_assemble_model.set_assembly_steps_json_str(model.get_assembly_steps_json_str());
+            if (!m_assemble_model.get_assembly_tree_json_str().empty()) {
+                std::string tree_error;
+                if (!AssemblyTreeData::from_json_string(m_assemble_model.get_assembly_tree_json_str(), m_assemble_model.get_assembly_tree_data(), &tree_error))
+                    BOOST_LOG_TRIVIAL(warning) << "derive_assemble_model: restore assembly tree failed: " << tree_error;
+            }
+            if (!m_assemble_model.get_assembly_steps_json_str().empty()) {
+                std::string steps_error;
+                float steps_font_size = 0.0f;
+                if (!AssemblyStepsTreeData::from_json_string(m_assemble_model.get_assembly_steps_json_str(), m_assemble_model.get_assembly_steps_tree_data(), m_assemble_model, &steps_error, &steps_font_size))
+                    BOOST_LOG_TRIVIAL(warning) << "derive_assemble_model: restore assembly steps failed: " << steps_error;
+            }
+            m_assemble_model_valid = true;
+#if !BBL_RELEASE_TO_PUBLIC
+            // [DIAG] temporary: verify the JSON-rebuilt assembly model actually carries objects/volumes/tree.
+            {
+                size_t vol_count = 0;
+                for (const ModelObject *mo : m_assemble_model.objects) vol_count += mo->volumes.size();
+                BOOST_LOG_TRIVIAL(debug) << "[assemble-derive] path=json objects=" << m_assemble_model.objects.size()
+                                           << " volumes=" << vol_count
+                                           << " tree_nodes=" << m_assemble_model.get_assembly_tree_data().nodes.size()
+                                           << " tree_json_len=" << m_assemble_model.get_assembly_tree_json_str().size()
+                                           << " src_parts=" << [&] { size_t c = 0; for (auto *mo : model.objects) for (auto *mv : mo->volumes) if (!mv->part_guid().empty()) ++c; return c; }();
+            }
+#endif
+            return;
+        }
+        BOOST_LOG_TRIVIAL(warning) << "derive_assemble_model: assembly_model.json parse failed, fall back to derive: " << assembly_model_error;
+    }
+
+    // Independent clone of the object graph; meshes stay shared via shared_ptr, GUIDs are copied.
+    m_assemble_model = model;
+    m_assemble_model.is_assembly_model = true; // debug marker for the assembly-view model
+    // Mark every assembly-side volume as referencing its prepare-side counterpart (same GUID).
+    for (ModelObject *mo : m_assemble_model.objects)
+        for (ModelVolume *mv : mo->volumes)
+            mv->set_assembly_src_guid(mv->part_guid());
+    m_assemble_model_valid = true;
+#if !BBL_RELEASE_TO_PUBLIC
+    // [DIAG] temporary: report the fallback-clone assembly model shape.
+    {
+        size_t vol_count = 0;
+        for (const ModelObject *mo : m_assemble_model.objects) vol_count += mo->volumes.size();
+        BOOST_LOG_TRIVIAL(debug) << "[assemble-derive] path=clone objects=" << m_assemble_model.objects.size()
+                                   << " volumes=" << vol_count
+                                   << " tree_nodes=" << m_assemble_model.get_assembly_tree_data().nodes.size()
+                                   << " model_json_present=" << (!model.get_assembly_model_json_str().empty());
+    }
+#endif
+}
+
+bool Plater::priv::assemble_model_needs_rederive_from_prepare() const
+{
+    // Live assemble already matches prepare well enough for incremental sync.
+    if (!m_assemble_model_valid || model.objects.empty())
+        return false;
+
+    // Prepare delete emptied the live assemble model (valid stays true). Prepare undo restores
+    // objects on the main model only — re-derive from assembly_model.json / clone instead of
+    // treating every object as a fresh import via set_assembly_pos.
+    if (m_assemble_model.objects.empty())
+        return true;
+
+    // Partial delete + undo: some prepare parts are back but missing from live assemble, while the
+    // persisted assembly graph still describes them. Prefer a full JSON restore over set_assembly_pos.
+    const std::string &json = model.get_assembly_model_json_str();
+    if (json.empty())
+        return false;
+
+    std::unordered_set<std::string> asm_guids;
+    for (const ModelObject *ao : m_assemble_model.objects)
+        for (const ModelVolume *mv : ao->volumes)
+            if (mv != nullptr && !mv->assembly_src_guid().empty())
+                asm_guids.insert(mv->assembly_src_guid());
+
+    for (const ModelObject *po : model.objects) {
+        for (const ModelVolume *mv : po->volumes) {
+            if (mv == nullptr || !mv->is_model_part())
+                continue;
+            const std::string &guid = mv->part_guid();
+            if (guid.empty() || asm_guids.count(guid) != 0)
+                continue;
+            // GUID appears in the persisted assembly graph → this is a restore hole, not a new part.
+            if (json.find(guid) != std::string::npos)
+                return true;
+        }
+    }
+    return false;
+}
+
+void Plater::priv::sync_assemble_model_on_enter(const std::vector<size_t>& loaded_idxs)
+{
+    if (!m_assemble_model_valid)
+        return;
+
+    // Ensure every prepare-side model part has a stable GUID so it can be matched / referenced.
+    for (ModelObject *po : model.objects)
+        for (ModelVolume *mv : po->volumes)
+            if (mv->is_model_part())
+                mv->ensure_part_guid();
+
+    // Pull the prepare side's latest render state (filament + MMU color painting) into the resident
+    // assembly model, so a prepare-side recolor / repaint made after the first derive shows up here.
+    sync_assemble_render_state(/*prepare_to_assemble*/ true);
+    // Re-share meshes edited on the prepare side (e.g. Simplify) into the resident assembly model.
+    sync_assemble_mesh_from_prepare();
+    // Reflect prepare-side scaling so the assembly part matches the prepare part's size.
+    sync_assemble_scale_from_prepare();
+
+    // Map each already-referenced prepare part_guid -> the assembly object that represents it. This lets
+    // us both (a) tell whether a prepare object is already synced and (b) find WHICH assembly object it
+    // maps to, so a volume newly added to an already-synced object can be appended into that same
+    // assembly object instead of being dropped (object-granular append only handled whole new objects).
+    std::unordered_map<std::string, int> assembly_obj_by_src_guid;
+    for (int ai = 0; ai < (int) m_assemble_model.objects.size(); ++ai) {
+        const ModelObject *ao = m_assemble_model.objects[ai];
+        for (const ModelVolume *mv : ao->volumes)
+            if (!mv->assembly_src_guid().empty())
+                assembly_obj_by_src_guid.emplace(mv->assembly_src_guid(), ai);
+    }
+
+    // STEP re-import: one shared extra assemble offset for every newly appended object.
+    // Computed before the loop from the existing assembly-view bbox, then ADDED onto each
+    // clone's existing assemble_offset (do not replace via set_assembly_pos).
+    Vec3d step_reimport_extra_offset = Vec3d::Zero();
+    if (!loaded_idxs.empty()) {
+        const BoundingBoxf3 existing_box = m_assemble_model.bounding_box_in_assembly_view();
+        if (existing_box.defined) {
+            BoundingBoxf3 incoming_box;
+            for (size_t pi : loaded_idxs) {
+                if (pi >= model.objects.size())
+                    continue;
+                ModelObject *po = model.objects[pi];
+                bool mapped = false;
+                for (ModelVolume *mv : po->volumes) {
+                    if (!mv->is_model_part())
+                        continue;
+                    if (assembly_obj_by_src_guid.count(mv->part_guid())) {
+                        mapped = true;
+                        break;
+                    }
+                }
+                if (mapped)
+                    continue;
+                // Clone keeps prepare assemble_offset, so this bbox predicts the batch layout.
+                incoming_box.merge(po->bounding_box_in_assembly_view());
+            }
+            // Place the whole incoming batch to the right of the existing scene (+10mm gap),
+            // same idea as Model::set_assembly_pos but as a uniform additive delta.
+            if (incoming_box.defined)
+                step_reimport_extra_offset.x() = existing_box.max.x() + 10.0 - incoming_box.min.x();
+            else
+                step_reimport_extra_offset.x() = existing_box.size().x() + 10.0;
+        }
+    }
+
+    for (int pi = 0; pi < (int) model.objects.size(); ++pi) {
+        if (!loaded_idxs.empty()) {
+            auto it = std::find(loaded_idxs.begin(), loaded_idxs.end(), (size_t)pi);
+            if (it == loaded_idxs.end())
+                continue;
+        }
+        ModelObject *po = model.objects[pi];
+        int mapped_ai = -1;
+        for (ModelVolume *mv : po->volumes) {
+            if (!mv->is_model_part())
+                continue;
+            auto it = assembly_obj_by_src_guid.find(mv->part_guid());
+            if (it != assembly_obj_by_src_guid.end()) {
+                mapped_ai = it->second;
+                break;
+            }
+        }
+
+        if (mapped_ai < 0) {
+            // Whole object not represented yet: append a clone (shares mesh, copies GUIDs).
+            ModelObject *ao = m_assemble_model.add_object(*po);
+            for (ModelVolume *mv : ao->volumes)
+                mv->set_assembly_src_guid(mv->part_guid());
+            // STEP re-import: keep cloned assemble_offset, then apply the shared extra shift.
+            // Otherwise place like a fresh import via set_assembly_pos — but only when the
+            // prepare-side instance never had an assemble pose. ModelInstance's clone ctor
+            // copies offsets yet resets m_assemble_initialized to false, so gating must use
+            // po (not ao); unconditional set_assembly_pos would wipe a restored / edited pose.
+            // Prepare-side po always mirrors ao so the assembly-view thumbnail stays in sync.
+            if (!loaded_idxs.empty()) {
+                for (ModelInstance *inst : ao->instances)
+                    inst->set_assemble_offset(inst->get_assemble_offset() + step_reimport_extra_offset);
+            } else {
+                bool po_assemble_initialized = false;
+                for (ModelInstance *inst : po->instances) {
+                    if (inst->is_assemble_initialized()) {
+                        po_assemble_initialized = true;
+                        break;
+                    }
+                }
+                if (!po_assemble_initialized) {
+                    m_assemble_model.set_assembly_pos(ao);
+                } else {
+                    // Re-flag the clone so later heal paths do not treat it as uninitialized.
+                    for (ModelInstance *inst : ao->instances)
+                        inst->set_assemble_offset(inst->get_assemble_offset());
+                }
+            }
+            for (size_t i = 0; i < ao->instances.size() && i < po->instances.size(); ++i)
+                po->instances[i]->set_assemble_offset(ao->instances[i]->get_assemble_offset());
+            // New object added to m_assemble_model: retained assembly snapshots no longer match, reset baseline.
+            m_assemble_undo_baseline_dirty = true;
+            continue;
+        }
+
+        // Object already represented: append any model-part volume whose GUID is not referenced yet, so
+        // adding a volume to an existing (already-synced) object propagates into its assembly counterpart.
+        ModelObject *ao = m_assemble_model.objects[mapped_ai];
+        for (ModelVolume *mv : po->volumes) {
+            if (!mv->is_model_part())
+                continue;
+            if (assembly_obj_by_src_guid.count(mv->part_guid()))
+                continue; // already referenced by some assembly object
+            ModelVolume *av = ao->add_volume(*mv); // shares mesh, copies config / type / GUID
+            av->set_assembly_src_guid(mv->part_guid());
+            // Keep the map current so a duplicate GUID within this pass is not appended twice.
+            assembly_obj_by_src_guid.emplace(mv->part_guid(), mapped_ai);
+            // New volume added to an existing assembly object: reset the assembly undo baseline.
+            m_assemble_undo_baseline_dirty = true;
+        }
+    }
+
+    // Prepare-side assemble_offset changed: force assembly-view thumbnail rebuild.
+    if (!loaded_idxs.empty() && step_reimport_extra_offset != Vec3d::Zero())
+        partplate_list.reset_thumbnail_assembly_view_data();
+
+    // Reconcile the other direction: drop assembly parts whose prepare counterpart is gone.
+    prune_orphan_assemble_parts();
+    // Refresh printable flags from prepare (clone-time copy alone is stale on re-enter).
+    sync_assemble_printable_from_prepare();
+}
+
+void Plater::priv::sync_assemble_printable_from_prepare()
+{
+    if (!m_assemble_model_valid)
+        return;
+
+    // Prepare part_guid -> printable of the owning prepare object/instance.
+    // Prepare-side UI still toggles object/instance printable; assembly greys by volume.
+    std::unordered_map<std::string, bool> prepare_printable_by_guid;
+    for (ModelObject *po : model.objects) {
+        if (!po)
+            continue;
+        bool printable = po->printable;
+        for (const ModelInstance *inst : po->instances) {
+            if (inst && !inst->printable) {
+                printable = false;
+                break;
+            }
+        }
+        for (ModelVolume *mv : po->volumes) {
+            if (mv && mv->is_model_part() && !mv->part_guid().empty())
+                prepare_printable_by_guid[mv->part_guid()] = printable;
+        }
+    }
+
+    for (ModelObject *ao : m_assemble_model.objects) {
+        if (!ao)
+            continue;
+        // Assembly-side printable is ModelVolume-only. Keep object/instance printable true so they
+        // never grey sibling volumes; any older object-level sync residue is cleared here.
+        ao->printable = true;
+        for (ModelInstance *inst : ao->instances)
+            if (inst)
+                inst->printable = true;
+
+        for (ModelVolume *av : ao->volumes) {
+            if (!av || !av->is_model_part())
+                continue;
+            const std::string &src = av->assembly_src_guid();
+            if (src.empty()) {
+                av->set_printable(true);
+                continue;
+            }
+            auto it = prepare_printable_by_guid.find(src);
+            av->set_printable(it == prepare_printable_by_guid.end() ? true : it->second);
+        }
+    }
+}
+
+void Plater::priv::prune_orphan_assemble_parts()
+{
+    if (!m_assemble_model_valid)
+        return;
+
+    // Prepare-side part GUIDs still present. An assembly volume whose assembly_src_guid is NOT in here has
+    // lost its prepare counterpart and must be pruned so the two models stay in sync. NOTE: prepare-side
+    // split/combine keep the original part GUIDs, so those parts stay matched and are never pruned (the
+    // "assembly structure is isolated from prepare-side split/merge" contract still holds).
+    std::set<std::string> prepare_guids;
+    for (const ModelObject *po : model.objects)
+        for (const ModelVolume *mv : po->volumes)
+            if (mv->is_model_part() && !mv->part_guid().empty())
+                prepare_guids.insert(mv->part_guid());
+
+    // Iterate back-to-front so index-based deletes do not invalidate the not-yet-visited indices.
+    for (int oi = (int) m_assemble_model.objects.size() - 1; oi >= 0; --oi) {
+        ModelObject *ao = m_assemble_model.objects[oi];
+        for (int vi = (int) ao->volumes.size() - 1; vi >= 0; --vi) {
+            ModelVolume *av = ao->volumes[vi];
+            const std::string &src = av->assembly_src_guid();
+            // Empty src_guid: never linked to a prepare part (e.g. a modifier), so leave it alone.
+            if (src.empty() || prepare_guids.count(src) > 0)
+                continue;
+            BOOST_LOG_TRIVIAL(info) << "[assemble-sync] prune orphan assembly volume '" << av->name
+                                    << "' in object '" << ao->name << "' (src_guid=" << src
+                                    << "): no matching prepare part";
+            ao->delete_volume((size_t) vi);
+            m_assemble_undo_baseline_dirty = true;
+        }
+        if (ao->volumes.empty()) {
+            BOOST_LOG_TRIVIAL(info) << "[assemble-sync] prune empty assembly object '" << ao->name
+                                    << "': no volumes left after orphan pruning";
+            m_assemble_model.delete_object((size_t) oi);
+            m_assemble_undo_baseline_dirty = true;
+        }
+    }
+}
+
+bool Plater::priv::sync_assemble_render_state(bool prepare_to_assemble)
+{
+    if (!m_assemble_model_valid)
+        return false;
+
+    // Index prepare-side model parts by stable part_guid. Both directions key the assembly volume by
+    // assembly_src_guid == prepare part_guid, so a split / combined part (whose guid is gone) is simply
+    // skipped, keeping its frozen render state (matches the "structure is isolated" contract).
+    std::unordered_map<std::string, ModelVolume *> prepare_by_guid;
+    for (ModelObject *po : model.objects)
+        for (ModelVolume *mv : po->volumes)
+            if (mv->is_model_part() && !mv->part_guid().empty())
+                prepare_by_guid.emplace(mv->part_guid(), mv);
+
+    bool changed = false;
+    for (ModelObject *ao : m_assemble_model.objects) {
+        for (ModelVolume *av : ao->volumes) {
+            const std::string &src = av->assembly_src_guid();
+            if (src.empty())
+                continue;
+            auto it = prepare_by_guid.find(src);
+            if (it == prepare_by_guid.end())
+                continue;
+            ModelVolume *pv   = it->second;
+            ModelVolume *dst  = prepare_to_assemble ? av : pv;
+            ModelVolume *from = prepare_to_assemble ? pv : av;
+
+            // Filament: compare resolved extruder ids so an object-level assignment on the prepare side is
+            // honored. Assemble→prepare must match prepare ObjectList: a single model_part object stores
+            // filament on ModelObject (and clears part overrides). Count model_parts only — modifiers do
+            // not force the per-volume path. Pure single-volume objects also match 3mf load, which erases
+            // the sole volume's "extruder".
+            const int from_extruder = from->extruder_id();
+            if (!prepare_to_assemble) {
+                ModelObject *dst_obj = dst->get_object();
+                int model_part_count = 0;
+                if (dst_obj != nullptr) {
+                    for (const ModelVolume *mv : dst_obj->volumes)
+                        if (mv && mv->is_model_part() && ++model_part_count > 1)
+                            break;
+                }
+                if (dst_obj != nullptr && model_part_count == 1) {
+                    const ConfigOptionInt *obj_ext =
+                        dynamic_cast<const ConfigOptionInt *>(dst_obj->config.option("extruder"));
+                    const int  obj_extruder     = (obj_ext == nullptr || obj_ext->getInt() == 0) ? 1 : obj_ext->getInt();
+                    const bool vol_has_override = dst->config.has("extruder");
+                    // Normalize even when resolved extruder_id already matches (volume override masking
+                    // a stale object-level value), otherwise save+reload drops the override and restores
+                    // the old object filament.
+                    if (obj_extruder != from_extruder || vol_has_override) {
+                        dst_obj->config.set_key_value("extruder", new ConfigOptionInt(from_extruder));
+                        dst->config.erase("extruder");
+                        changed = true;
+                    }
+                } else if (dst->extruder_id() != from_extruder) {
+                    dst->config.set_key_value("extruder", new ConfigOptionInt(from_extruder));
+                    changed = true;
+                }
+            } else if (dst->extruder_id() != from_extruder) {
+                dst->config.set_key_value("extruder", new ConfigOptionInt(from_extruder));
+                changed = true;
+            }
+
+            // MMU color painting. get_data() is a cheap value compare that only fires on a view switch;
+            // FacetsAnnotation::assign() is timestamp-guarded so it copies data + the source timestamp,
+            // keeping both sides' timestamps aligned and avoiding ping-pong on repeated syncs.
+            if (from->mmu_segmentation_facets.get_data() != dst->mmu_segmentation_facets.get_data()) {
+                dst->mmu_segmentation_facets.assign(from->mmu_segmentation_facets);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+void Plater::priv::propagate_delete_to_assemble(const ModelObject &prepare_object)
+{
+    if (!m_assemble_model_valid)
+        return;
+    // split / combine re-create prepare objects via remove()+add; that internal remove is not a user
+    // delete and must not tear down the assembly object that froze the pre-split state.
+    if (m_suppress_assemble_delete_propagation)
+        return;
+
+    std::set<std::string> deleted_guids;
+    for (const ModelVolume *mv : prepare_object.volumes)
+        if (mv->is_model_part() && !mv->part_guid().empty())
+            deleted_guids.insert(mv->part_guid());
+    if (deleted_guids.empty())
+        return;
+
+    // Remove every assembly object that references one of the deleted prepare parts. Only genuine user
+    // deletes reach here; split/combine suppress propagation above so the assembly view is unaffected.
+    for (int i = (int) m_assemble_model.objects.size() - 1; i >= 0; --i) {
+        const ModelObject *ao = m_assemble_model.objects[i];
+        bool references_deleted = false;
+        for (const ModelVolume *mv : ao->volumes) {
+            if (!mv->assembly_src_guid().empty() && deleted_guids.count(mv->assembly_src_guid())) {
+                references_deleted = true;
+                break;
+            }
+        }
+        if (references_deleted) {
+            m_assemble_model.delete_object((size_t) i);
+            // m_assemble_model shrank outside the assembly stack: reset its undo baseline on next entry.
+            m_assemble_undo_baseline_dirty = true;
+        }
+    }
+}
+
+void Plater::priv::propagate_volume_delete_to_assemble(const ModelVolume &prepare_volume)
+{
+    if (!m_assemble_model_valid)
+        return;
+    // split / combine tear down and rebuild volumes internally; that is not a user delete and must not
+    // touch the assembly model (which froze the pre-split structure).
+    if (m_suppress_assemble_delete_propagation)
+        return;
+    if (!prepare_volume.is_model_part())
+        return;
+    const std::string guid = prepare_volume.part_guid();
+    if (guid.empty())
+        return;
+
+    // Remove the assembly volume(s) that reference this exact prepare part. Unlike the object-level
+    // propagation, keep the assembly object itself; only drop the matching volume. If that empties the
+    // object, drop the now-empty object as well.
+    for (int oi = (int) m_assemble_model.objects.size() - 1; oi >= 0; --oi) {
+        ModelObject *ao = m_assemble_model.objects[oi];
+        bool removed_any = false;
+        for (int vi = (int) ao->volumes.size() - 1; vi >= 0; --vi) {
+            const ModelVolume *mv = ao->volumes[vi];
+            if (mv != nullptr && mv->assembly_src_guid() == guid) {
+                ao->delete_volume((size_t) vi);
+                removed_any = true;
+            }
+        }
+        if (removed_any) {
+            if (ao->volumes.empty())
+                m_assemble_model.delete_object((size_t) oi);
+            // m_assemble_model changed outside the assembly stack: reset its undo baseline on next entry.
+            m_assemble_undo_baseline_dirty = true;
+        }
+    }
+}
+
+void Plater::priv::sync_assemble_volume_name(const std::string &part_guid, const std::string &new_name)
+{
+    if (!m_assemble_model_valid || part_guid.empty())
+        return;
+    int asm_oi = -1, asm_vi = -1;
+    for (int oi = 0; oi < (int) m_assemble_model.objects.size(); ++oi) {
+        ModelObject *ao = m_assemble_model.objects[oi];
+        for (int vi = 0; vi < (int) ao->volumes.size(); ++vi) {
+            ModelVolume *av = ao->volumes[vi];
+            if (av->assembly_src_guid() == part_guid) {
+                av->name = new_name;
+                asm_oi = oi;
+                asm_vi = vi;
+                break;
+            }
+        }
+        if (asm_oi >= 0) break;
+    }
+    if (asm_oi < 0)
+        return;
+    // Patch assembly view UI trees when the assembly view is active
+    if (assemble_view) {
+        GLCanvas3D *canvas = assemble_view->get_canvas3d();
+        if (canvas)
+            canvas->on_prepare_volume_renamed(asm_oi, asm_vi, new_name);
+    }
+}
+
+void Plater::priv::change_extruder_for_assemble_selection(int extruder)
+{
+    if (!m_assemble_model_valid || assemble_view == nullptr)
+        return;
+    const std::vector<std::string> colors = q->get_extruder_colors_from_plater_config();
+    if (extruder > (int) colors.size())
+        return;
+    GLCanvas3D *canvas = assemble_view->get_canvas3d();
+    if (canvas == nullptr)
+        return;
+    const Selection &sel = canvas->get_selection();
+    if (sel.is_empty())
+        return;
+
+    // Snapshot on the assembly undo stack (active while in the assembly view).
+    take_snapshot("Change Filaments");
+    bool changed = false;
+    for (unsigned int idx : sel.get_volume_idxs()) {
+        const GLVolume *v = sel.get_volume(idx);
+        if (v == nullptr)
+            continue;
+        const int oi = v->object_idx();
+        const int vi = v->volume_idx();
+        if (oi < 0 || oi >= (int) m_assemble_model.objects.size())
+            continue;
+        ModelObject *mo = m_assemble_model.objects[oi];
+        if (mo == nullptr || vi < 0 || vi >= (int) mo->volumes.size())
+            continue;
+        ModelVolume *mv = mo->volumes[vi];
+        if (mv == nullptr || (!mv->is_model_part() && mv->type() != ModelVolumeType::PARAMETER_MODIFIER))
+            continue;
+        // extruder 0 == "Default": a volume then inherits its object's filament, so drop the per-volume
+        // override; otherwise pin the chosen filament on the volume.
+        if (extruder == 0) {
+            if (mv->config.has("extruder"))
+                mv->config.erase("extruder");
+        } else {
+            mv->config.set_key_value("extruder", new ConfigOptionInt(extruder));
+        }
+        changed = true;
+    }
+    if (!changed)
+        return;
+    // reload_scene() re-runs update_volumes_colors_by_extruder(), so the assembly view recolors at once.
+    canvas->reload_scene(true);
+    canvas->set_as_dirty();
+}
+
+void Plater::priv::sync_assemble_mesh_from_prepare()
+{
+    if (!m_assemble_model_valid)
+        return;
+
+    // Prepare-side part_guid -> current prepare ModelVolume (the mesh source of truth).
+    std::unordered_map<std::string, const ModelVolume *> prepare_by_guid;
+    for (const ModelObject *po : model.objects)
+        for (const ModelVolume *mv : po->volumes)
+            if (mv->is_model_part() && !mv->part_guid().empty())
+                prepare_by_guid.emplace(mv->part_guid(), mv);
+
+    for (ModelObject *ao : m_assemble_model.objects) {
+        bool any_remesh = false;
+        for (ModelVolume *av : ao->volumes) {
+            const std::string &src = av->assembly_src_guid();
+            if (src.empty())
+                continue;
+            auto it = prepare_by_guid.find(src);
+            if (it == prepare_by_guid.end())
+                continue; // split / combined on the prepare side: keep the frozen mesh
+            const ModelVolume *pv = it->second;
+            // Meshes are shared_ptr; a prepare-side edit (Simplify, ...) swaps in a NEW shared_ptr while
+            // the assembly clone still points at the old one. Compare the raw pointers and only rebind
+            // when they diverge.
+            if (av->get_mesh_shared_ptr().get() == pv->get_mesh_shared_ptr().get())
+                continue;
+            std::shared_ptr<const TriangleMesh> shared_mesh = pv->get_mesh_shared_ptr();
+            av->set_mesh(shared_mesh);
+            av->set_convex_hull_shared_ptr(pv->get_convex_hull_shared_ptr());
+            // New ObjectID so reload_scene() rebuilds this volume's GLVolume (re-uploads the new mesh)
+            // instead of reusing the cached one keyed by the old geometry id.
+            av->set_new_unique_id();
+            any_remesh = true;
+        }
+        if (any_remesh) {
+            ao->invalidate_bounding_box();
+            // A prepare-side mesh edit re-shared new geometry into m_assemble_model (new ObjectIDs): the
+            // retained assembly snapshots reference the old volume ids, so reset the undo baseline.
+            m_assemble_undo_baseline_dirty = true;
+        }
+    }
+}
+
+void Plater::priv::sync_assemble_scale_from_prepare()
+{
+    if (!m_assemble_model_valid)
+        return;
+
+    // Prepare-side part_guid -> (owning prepare object, prepare volume). A part's displayed size is
+    // instance_scale ⊙ volume_scale, so BOTH object-level (instance) and part-level (volume) prepare
+    // scaling must be reproduced. The assembly view has no scale tool, so size is prepare-authoritative.
+    struct PrepareRef { const ModelObject *po; const ModelVolume *pv; };
+    std::unordered_map<std::string, PrepareRef> prepare_by_guid;
+    for (const ModelObject *po : model.objects)
+        for (const ModelVolume *mv : po->volumes)
+            if (mv->is_model_part() && !mv->part_guid().empty())
+                prepare_by_guid.emplace(mv->part_guid(), PrepareRef{po, mv});
+
+    // Pass 1: work out every assembly volume's target scale without writing anything yet, and decide
+    // whether the prepare side rescaled the WHOLE model by one uniform factor. That case needs more than
+    // a size update: the assembly poses are authored independently (a STEP import merges the parts into
+    // one prepare object while the assembly splits them over several objects / instances), so they do not
+    // ride along with the prepare instance scale. Resizing the parts alone would leave the old spacing
+    // behind and the assembly would fall apart, so the poses are scaled about a common pivot below.
+    //
+    // When only SOME prepare objects were rescaled (e.g. cube left alone, STEP object scaled), the
+    // whole-model uniformity test fails. Fall back to per-prepare-object groups: each group that shares
+    // one uniform ratio gets its own pose rescale about that group's ground-level centre.
+    struct PendingScale { int oi; int vi; Vec3d target; };
+    struct MatchedPart {
+        int                 oi;
+        int                 vi;
+        const ModelObject  *prepare_obj;
+        double              ratio;        // valid when axes_uniform
+        bool                axes_uniform;
+    };
+    std::vector<PendingScale> pending;
+    std::vector<MatchedPart>  matched;
+    bool   scale_parts_uniformly = true; // every part changes by the same uniform factor
+    double uniform_ratio         = 0.0;  // that factor; 0 = not seen yet
+
+    for (int oi = 0; oi < (int) m_assemble_model.objects.size(); ++oi) {
+        ModelObject *ao = m_assemble_model.objects[oi];
+        // At render the assembly world size = instance.assemble_scale ⊙ volume.assemble_scale. The assembly
+        // object's instance scale need not match the prepare object's (a STEP import merges prepare parts
+        // into one object while the assembly keeps each part as its own object / instance), so read it here
+        // and divide it out below -- the reproduced part size is then exact regardless of the grouping.
+        const Vec3d asm_inst_scale = ao->instances.empty() ? Vec3d::Ones()
+            : ao->instances.front()->get_assemble_transformation().get_scaling_factor();
+        for (int vi = 0; vi < (int) ao->volumes.size(); ++vi) {
+            ModelVolume *av = ao->volumes[vi];
+            if (!av->is_model_part())
+                continue;
+            const std::string &src = av->assembly_src_guid();
+            if (src.empty()) {
+                scale_parts_uniformly = false;
+                continue;
+            }
+            auto it = prepare_by_guid.find(src);
+            if (it == prepare_by_guid.end()) {
+                scale_parts_uniformly = false;
+                continue; // split / combined on the prepare side: keep the frozen pose
+            }
+            const ModelObject *po = it->second.po;
+            const ModelVolume *pv = it->second.pv;
+
+            // target assembly volume scale = prepare world size / assembly instance scale, so that
+            //   asm_inst_scale ⊙ target == prepare_instance_scale ⊙ prepare_volume_scale (the prepare size).
+            // Only the scale is rewritten; the assembly-authored rotation / mirror stay intact
+            // (get_assemble_transformation() falls back to the base transform for a not-yet-posed part).
+            // (Instance 0; componentwise, matching the codebase's scaling-factor convention.)
+            const Vec3d prepare_inst_scale = po->instances.empty() ? Vec3d::Ones()
+                : po->instances.front()->get_scaling_factor();
+            const Vec3d target_volume_scale = prepare_inst_scale
+                                                  .cwiseProduct(pv->get_transformation().get_scaling_factor())
+                                                  .cwiseQuotient(asm_inst_scale);
+
+            // set/get round-trips through matrix decomposition, so compare with a tolerance instead of ==
+            // to avoid rewriting (and needlessly resetting the assembly undo baseline) on every entry.
+            const Vec3d current_volume_scale = av->get_assemble_transformation().get_scaling_factor();
+            if ((current_volume_scale - target_volume_scale).cwiseAbs().maxCoeff() > 1e-6)
+                pending.push_back(PendingScale{oi, vi, target_volume_scale});
+
+            bool   axes_uniform = false;
+            double ratio        = 0.0;
+            if (current_volume_scale.cwiseAbs().minCoeff() >= EPSILON) {
+                const Vec3d r = target_volume_scale.cwiseQuotient(current_volume_scale);
+                if (r.maxCoeff() - r.minCoeff() <= 1e-6) {
+                    axes_uniform = true;
+                    ratio        = r.x();
+                }
+            }
+            matched.push_back(MatchedPart{oi, vi, po, ratio, axes_uniform});
+
+            // A part left untouched contributes ratio 1, so a partial (single part / single object)
+            // prepare-side rescale breaks the whole-model uniformity test; the per-prepare-object
+            // fallback below still rescales poses inside each uniformly scaled group.
+            if (!scale_parts_uniformly || !axes_uniform) {
+                scale_parts_uniformly = false;
+                continue;
+            }
+            if (uniform_ratio == 0.0)
+                uniform_ratio = ratio;
+            else if (std::abs(ratio - uniform_ratio) > 1e-6)
+                scale_parts_uniformly = false;
+        }
+    }
+
+    if (pending.empty())
+        return;
+
+    const bool rescale_poses_global = scale_parts_uniformly && uniform_ratio > 0.0 && std::abs(uniform_ratio - 1.0) > 1e-6;
+
+    // Ground-level centre of the given assembly volumes: keeps place and footing, mirroring the prepare
+    // side (scaled about the selection box centre by Selection::scale_and_translate(), then dropped
+    // back onto the bed by ensure_on_bed()).
+    auto ground_center_pivot = [&](const std::vector<std::pair<int, int>> &vols) -> Vec3d {
+        BoundingBoxf3 box;
+        for (const auto &key : vols) {
+            if (key.first < 0 || key.first >= (int) m_assemble_model.objects.size())
+                continue;
+            const ModelObject *ao = m_assemble_model.objects[key.first];
+            if (ao->instances.empty() || key.second < 0 || key.second >= (int) ao->volumes.size())
+                continue;
+            const ModelVolume *av = ao->volumes[key.second];
+            if (!av->is_model_part() || av->mesh_ptr() == nullptr)
+                continue;
+            const Transform3d inst_matrix = ao->instances.front()->get_assemble_transformation().get_matrix();
+            box.merge(av->mesh().bounding_box().transformed(inst_matrix * av->get_assemble_transformation().get_matrix()));
+        }
+        if (!box.defined)
+            return Vec3d::Zero();
+        return Vec3d(box.center().x(), box.center().y(), box.min.z());
+    };
+
+    // volume key -> ratio used to scale that volume's assemble offset (pose rescale only).
+    std::map<std::pair<int, int>, double> volume_offset_ratios;
+    // assembly object index -> (ratio, pivot) for instance assemble-offset rescale.
+    std::map<int, std::pair<double, Vec3d>> instance_rescales;
+
+    if (rescale_poses_global) {
+        std::vector<std::pair<int, int>> all_vols;
+        for (const MatchedPart &mp : matched)
+            all_vols.emplace_back(mp.oi, mp.vi);
+        const Vec3d pivot = ground_center_pivot(all_vols);
+        for (const PendingScale &ps : pending)
+            volume_offset_ratios.emplace(std::pair<int, int>{ps.oi, ps.vi}, uniform_ratio);
+        for (int oi = 0; oi < (int) m_assemble_model.objects.size(); ++oi)
+            instance_rescales.emplace(oi, std::make_pair(uniform_ratio, pivot));
+    } else {
+        // Group matched assembly parts by their prepare-side owning object.
+        std::unordered_map<const ModelObject *, std::vector<size_t>> by_prepare;
+        for (size_t i = 0; i < matched.size(); ++i)
+            by_prepare[matched[i].prepare_obj].push_back(i);
+
+        for (auto &kv : by_prepare) {
+            const std::vector<size_t> &idxs = kv.second;
+            bool   group_uniform = true;
+            double group_ratio   = 0.0;
+            for (size_t i : idxs) {
+                const MatchedPart &mp = matched[i];
+                if (!mp.axes_uniform) {
+                    group_uniform = false;
+                    break;
+                }
+                if (group_ratio == 0.0)
+                    group_ratio = mp.ratio;
+                else if (std::abs(mp.ratio - group_ratio) > 1e-6) {
+                    group_uniform = false;
+                    break;
+                }
+            }
+            if (!group_uniform || group_ratio <= 0.0 || std::abs(group_ratio - 1.0) <= 1e-6)
+                continue; // size-only for this prepare object
+
+            std::vector<std::pair<int, int>> group_vols;
+            group_vols.reserve(idxs.size());
+            for (size_t i : idxs)
+                group_vols.emplace_back(matched[i].oi, matched[i].vi);
+            const Vec3d pivot = ground_center_pivot(group_vols);
+            for (size_t i : idxs) {
+                const MatchedPart &mp = matched[i];
+                volume_offset_ratios.emplace(std::pair<int, int>{mp.oi, mp.vi}, group_ratio);
+                instance_rescales.emplace(mp.oi, std::make_pair(group_ratio, pivot));
+            }
+        }
+    }
+
+    // Pass 2: write the part scales. A volume's assemble offset lives in object space and reaches the
+    // world through the (unchanged) instance matrix, so scaling it by the same factor moves the part
+    // exactly as far as the instance below.
+    std::map<std::pair<int, int>, Vec3d> new_volume_scales;
+    for (const PendingScale &ps : pending) {
+        ModelObject *ao = m_assemble_model.objects[ps.oi];
+        ModelVolume *av = ao->volumes[ps.vi];
+        Geometry::Transformation asm_trafo = av->get_assemble_transformation();
+        asm_trafo.set_scaling_factor(ps.target);
+        const auto key = std::pair<int, int>{ps.oi, ps.vi};
+        auto       rit = volume_offset_ratios.find(key);
+        if (rit != volume_offset_ratios.end())
+            asm_trafo.set_offset(asm_trafo.get_offset() * rit->second);
+        av->set_assemble_transformation(asm_trafo);
+        ao->invalidate_bounding_box();
+        new_volume_scales.emplace(key, ps.target);
+    }
+    // Geometry of m_assemble_model changed outside the assembly stack: reset the undo baseline.
+    m_assemble_undo_baseline_dirty = true;
+
+    for (const auto &kv : instance_rescales) {
+        const int     oi    = kv.first;
+        const double  ratio = kv.second.first;
+        const Vec3d  &pivot = kv.second.second;
+        if (oi < 0 || oi >= (int) m_assemble_model.objects.size())
+            continue;
+        ModelObject *ao = m_assemble_model.objects[oi];
+        for (ModelInstance *inst : ao->instances) {
+            Geometry::Transformation inst_trafo = inst->get_assemble_transformation();
+            inst_trafo.set_offset(pivot + ratio * (inst_trafo.get_offset() - pivot));
+            inst->set_assemble_transformation(inst_trafo);
+        }
+        ao->invalidate_bounding_box();
+    }
+
+    // Mirror the new scale (and, for a whole-model / per-object rescale, the moved poses) to every
+    // keyframe entry, preserving each keyframe's recorded rotation. Explode offsets scale along with
+    // the model.
+    auto &steps_tree = m_assemble_model.get_assembly_steps_tree_data();
+    if (!steps_tree.nodes.empty()) {
+        std::function<void(int)> update_kf;
+        update_kf = [&](int nid) {
+            if (nid < 0 || nid >= (int) steps_tree.nodes.size())
+                return;
+            auto &node = steps_tree.nodes[nid];
+            for (auto &entry : node.kf_data.entries) {
+                bool touched = false;
+                for (auto &ot : entry.data.object_transformations) {
+                    auto iit = instance_rescales.find(ot.first);
+                    if (iit == instance_rescales.end())
+                        continue;
+                    const double ratio = iit->second.first;
+                    const Vec3d &pivot = iit->second.second;
+                    ot.second.set_offset(pivot + ratio * (ot.second.get_offset() - pivot));
+                    touched = true;
+                }
+                for (auto &vt : entry.data.volume_transformations) {
+                    auto sit = new_volume_scales.find(vt.first);
+                    if (sit == new_volume_scales.end())
+                        continue;
+                    vt.second.set_scaling_factor(sit->second);
+                    auto rit = volume_offset_ratios.find(vt.first);
+                    if (rit != volume_offset_ratios.end())
+                        vt.second.set_offset(vt.second.get_offset() * rit->second);
+                    touched = true;
+                }
+                if (touched)
+                    entry.need_save = true;
+            }
+            for (int child : node.children)
+                update_kf(child);
+        };
+        for (int root : steps_tree.roots)
+            update_kf(root);
+    }
+}
+
+void Plater::priv::sync_assemble_steps_to_main_model()
+{
+    // Assembly steps / tree are authored on the independent assembly model while in the assembly view
+    // (AssemblyStepsUtils is bound to m_assemble_model there). The 3mf exporter, however, serializes the
+    // assembly artifacts from the prepare model. Mirror them back so assembly edits are persisted.
+    // For objects shared by both models the ObjectIDs match (assign_copy preserves them via copy_id), so
+    // the json/tree node->object_id references resolve correctly against the prepare model on reload.
+    if (!m_assemble_model_valid)
+        return;
+    model.set_assembly_steps_json_str(m_assemble_model.get_assembly_steps_json_str());
+    model.get_assembly_tree_data()       = m_assemble_model.get_assembly_tree_data();
+    model.get_assembly_steps_tree_data() = m_assemble_model.get_assembly_steps_tree_data();
+    // Serialize the independent assembly object graph (structure + poses, no geometry) so the assembly
+    // view's structural state survives reload. On load it is rebuilt by rebinding meshes from the prepare
+    // model by part_guid (see derive_assemble_model).
+    model.set_assembly_model_json_str(assembly_model_to_json_string(m_assemble_model));
+    // Write assembly-side filament / MMU painting edits back to the prepare model ONLY while actually in
+    // the assembly context (leaving the assembly view, or saving from within it: active stack == assemble).
+    // This function also runs from export_3mf() on ordinary prepare-view saves; doing the write-back there
+    // would clobber a fresh prepare-view edit (e.g. painting a stroke, then saving / slicing) with the
+    // assembly model's stale data. The prepare->assembly direction is refreshed on assembly-view entry.
+    if (m_undo_redo_stack_active == &m_undo_redo_stack_assemble) {
+        // Filament / painting write-back updates the prepare Model, but ObjectList caches
+        // its own extruder strings. Refresh the filament column so Prepare view matches.
+        if (sync_assemble_render_state(/*prepare_to_assemble*/ false)) {
+            if (ObjectList *ol = wxGetApp().obj_list())
+                ol->sync_filament_from_model();
+        }
+    }
+}
+
+void Plater::priv::enter_assemble_stack()
+{
+    // The gizmos that open the gizmos stack (SLA supports / brim ears) are prepare-view only, so the
+    // assembly stack can safely take over the active pointer from the main stack here.
+    assert(m_undo_redo_stack_active == &m_undo_redo_stack_main);
+    if (m_undo_redo_stack_active == &m_undo_redo_stack_main) {
+        m_undo_redo_stack_active = &m_undo_redo_stack_assemble;
+        // Keep the assembly undo history across view switches. Only (re)establish a fresh baseline when
+        // there is no history yet, or when a prepare-side structural change invalidated it (the retained
+        // snapshots would no longer match m_assemble_model). Otherwise leave the stack untouched so the
+        // user can keep undoing edits made in earlier assembly-view sessions.
+        if (m_undo_redo_stack_assemble.empty() || m_assemble_undo_baseline_dirty) {
+            // Preserve unsaved assembly edits across a forced baseline rebuild (prepare-side
+            // structural sync). The new baseline already contains those edits, so the stack tip
+            // looks "clean" — keep the dirty flag so close/new-project still prompts to save.
+            const bool keep_assemble_dirty = m_assemble_project_dirty;
+            m_undo_redo_stack_assemble.clear();
+            clear_assemble_guide_ui_snapshots();
+            // The trailing '!' marks a non-project-modifying baseline snapshot (see snapshot_modifies_project),
+            // so can_undo() reports false until the user actually edits something here -> the toolbar Undo
+            // icon stays greyed out at the baseline. Not localized on purpose, never shown to the user.
+            this->take_snapshot(std::string("Assemble-Initial!"));
+            m_assemble_undo_baseline_dirty = false;
+            // Establish a known saved tip so project_modified() works for undo/redo dirty refresh.
+            m_undo_redo_stack_assemble.mark_current_as_saved();
+            m_assemble_project_dirty = keep_assemble_dirty;
+        }
+    }
+}
+
+bool Plater::priv::leave_assemble_stack()
+{
+    // Mirror assembly-view edits back onto the prepare model on exit so any prepare-side reader (and the
+    // next 3mf export) sees the up-to-date assembly steps / tree.
+    sync_assemble_steps_to_main_model();
+    bool changed = false;
+    assert(m_undo_redo_stack_active == &m_undo_redo_stack_assemble);
+    if (m_undo_redo_stack_active == &m_undo_redo_stack_assemble) {
+        changed = m_undo_redo_stack_assemble.has_undo_snapshot();
+        // Do NOT clear the assembly stack here: it is retained across view switches (see enter_assemble_stack).
+        // It is only reset lazily on the next entry when m_assemble_undo_baseline_dirty is set, or wiped on
+        // project reset. This is what lets the user undo assembly edits after leaving and re-entering.
+        m_undo_redo_stack_active = &m_undo_redo_stack_main;
+    }
+    return changed;
+}
+
+void Plater::priv::remember_assemble_guide_ui(size_t snapshot_timestamp)
+{
+    if (!assemble_view)
+        return;
+    AssemblyGuideUiSnapshot ui;
+    assemble_view->get_canvas3d()->capture_assembly_guide_ui_for_snapshot(ui.selected_folder_id, ui.keyframe_selected);
+    m_assemble_guide_ui_by_time[snapshot_timestamp] = ui;
+}
+
+void Plater::priv::remember_assemble_guide_ui_for_latest_action_snapshot()
+{
+    // take_snapshot() appends: [..., action_snapshot, topmost]. Key the UI to the action snapshot.
+    const auto &ss = m_undo_redo_stack_assemble.snapshots();
+    if (ss.size() < 2)
+        return;
+    remember_assemble_guide_ui(ss[ss.size() - 2].timestamp);
+    // Also tag the live topmost so leaving/re-entering that time (redo after undo-capture) finds UI.
+    remember_assemble_guide_ui(ss.back().timestamp);
+}
+
+void Plater::priv::prune_assemble_guide_ui_snapshots()
+{
+    std::unordered_set<size_t> live;
+    live.reserve(m_undo_redo_stack_assemble.snapshots().size());
+    for (const auto &s : m_undo_redo_stack_assemble.snapshots())
+        live.insert(s.timestamp);
+    for (auto it = m_assemble_guide_ui_by_time.begin(); it != m_assemble_guide_ui_by_time.end();) {
+        if (live.count(it->first) == 0)
+            it = m_assemble_guide_ui_by_time.erase(it);
+        else
+            ++it;
+    }
+}
+
+void Plater::priv::assemble_undo_redo_to(std::vector<UndoRedo::Snapshot>::const_iterator it_snapshot)
+{
+    // Slim, self-contained jump that only touches the assembly model + assembly canvas.
+    // Deliberately does NOT run the prepare-model machinery (wipe tower / presets / sidebar / slicing).
+    SuppressSnapshots snapshot_supressor(q);
+
+    GLCanvas3D* assemble_canvas = assemble_view->get_canvas3d();
+    UndoRedo::SnapshotData top_snapshot_data;
+    top_snapshot_data.printer_technology = this->printer_technology;
+
+    // Preserve the UI cursor of the state we are leaving so redo can find it. StackImpl::undo may
+    // capture an uncaptured topmost via its own take_snapshot (bypassing Plater::take_snapshot).
+    remember_assemble_guide_ui(m_undo_redo_stack_assemble.active_snapshot_time());
+
+    const UndoRedo::Snapshot snapshot_copy = *it_snapshot;
+    const bool jumped = it_snapshot->timestamp < m_undo_redo_stack_assemble.active_snapshot_time() ?
+        m_undo_redo_stack_assemble.undo(m_assemble_model, assemble_canvas->get_selection(), assemble_canvas->get_gizmos_manager(), this->partplate_list, top_snapshot_data, it_snapshot->timestamp) :
+        m_undo_redo_stack_assemble.redo(m_assemble_model, assemble_canvas->get_gizmos_manager(), this->partplate_list, it_snapshot->timestamp);
+    if (jumped) {
+        prune_assemble_guide_ui_snapshots();
+        if (!m_assemble_model.get_assembly_tree_json_str().empty()) {
+            std::string tree_error;
+            if (!AssemblyTreeData::from_json_string(m_assemble_model.get_assembly_tree_json_str(), m_assemble_model.get_assembly_tree_data(), &tree_error))
+                BOOST_LOG_TRIVIAL(warning) << "assemble_undo_redo_to: restore assembly tree failed: " << tree_error;
+        }
+        if (!m_assemble_model.get_assembly_steps_json_str().empty()) {
+            std::string steps_error;
+            float steps_font_size = 0.0f;
+            if (!AssemblyStepsTreeData::from_json_string(m_assemble_model.get_assembly_steps_json_str(), m_assemble_model.get_assembly_steps_tree_data(), m_assemble_model, &steps_error, &steps_font_size))
+                BOOST_LOG_TRIVIAL(warning) << "assemble_undo_redo_to: restore assembly steps failed: " << steps_error;
+        } else {
+            m_assemble_model.get_assembly_steps_tree_data() = AssemblyStepsTreeData();
+        }
+        assemble_canvas->get_selection().clear();
+        assemble_canvas->reload_scene(true);
+        // Restore the selection captured in the target snapshot. The main stack does this in
+        // Plater::priv::update_after_undo_redo; the slim assembly path must mirror it. Without it the assembly
+        // selection stays empty after undo/redo, which crashes selection-driven gizmos (e.g. MMU segmentation's
+        // render_triangles dereferences selection_info()->model_object()).
+        assemble_canvas->get_selection().set_deserialized(
+            GUI::Selection::EMode(m_undo_redo_stack_assemble.selection_deserialized().mode),
+            m_undo_redo_stack_assemble.selection_deserialized().volumes_and_instances);
+        // GLGizmosManager::load() (invoked by the undo/redo above) sets m_serializing = true and relies on
+        // update_after_undo_redo() to clear it again. The main stack does this in Plater::priv::update_after_undo_redo;
+        // the slim assembly path must mirror it, otherwise the manager stays "serializing" forever and
+        // reset_all_states()/exit_gizmo turn into no-ops -> the Move gizmo can no longer be closed on playback
+        // or step switch. Prefer update_after_undo_redo() over a bare update_data() for exactly this reset.
+        assemble_canvas->get_gizmos_manager().update_after_undo_redo(snapshot_copy);
+        // Restore guide UI cursor from the side map (not SnapshotData). Do NOT call active_view().
+        int restore_folder_id = -1;
+        int restore_kf        = -1;
+        if (auto it_ui = m_assemble_guide_ui_by_time.find(snapshot_copy.timestamp);
+            it_ui != m_assemble_guide_ui_by_time.end()) {
+            restore_folder_id = it_ui->second.selected_folder_id;
+            restore_kf        = it_ui->second.keyframe_selected;
+        }
+        assemble_canvas->restore_assembly_guide_ui_after_undo(restore_folder_id, restore_kf);
+        assemble_canvas->set_as_dirty();
+        // Refresh assembly dirty from the stack tip vs last mark_current_as_saved so undoing
+        // all the way back to the saved tip clears the unsaved-project prompt.
+        m_assemble_project_dirty = m_undo_redo_stack_assemble.project_modified();
+        if (m_assemble_project_dirty)
+            set_plater_dirty(true);
+    }
+}
+
 int Plater::priv::get_active_snapshot_index()
 {
     const size_t active_snapshot_time = this->undo_redo_stack().active_snapshot_time();
@@ -16899,6 +18852,26 @@ void Plater::priv::take_snapshot(const std::string& snapshot_name, const UndoRed
     if (m_prevent_snapshots > 0)
         return;
     assert(m_prevent_snapshots >= 0);
+    // Assembly stack: take a slim snapshot of m_assemble_model only, bypassing the prepare-model
+    // project machinery (wipe tower / presets / sidebar). Must run before the m_single project filter.
+    if (m_undo_redo_stack_active == &m_undo_redo_stack_assemble) {
+        UndoRedo::SnapshotData assemble_snapshot_data;
+        assemble_snapshot_data.snapshot_type      = snapshot_type;
+        assemble_snapshot_data.printer_technology = this->printer_technology;
+        GLCanvas3D* assemble_canvas = assemble_view->get_canvas3d();
+        m_undo_redo_stack_assemble.take_snapshot(snapshot_name, m_assemble_model, assemble_canvas->get_selection(), assemble_canvas->get_gizmos_manager(), this->partplate_list, assemble_snapshot_data);
+        remember_assemble_guide_ui_for_latest_action_snapshot();
+        m_undo_redo_stack_assemble.release_least_recently_used();
+        prune_assemble_guide_ui_snapshots();
+        // Assembly edits live on an independent stack; the main-stack up_to_date() check cannot
+        // see them. Mark the project dirty so close / new-project prompts still ask to save.
+        if (snapshot_modifies_project(snapshot_type) && (snapshot_name.empty() || snapshot_name.back() != '!')) {
+            m_assemble_project_dirty = true;
+            set_plater_dirty(true);
+        }
+        BOOST_LOG_TRIVIAL(info) << "Assemble Undo / Redo snapshot taken: " << snapshot_name;
+        return;
+    }
     // BBS: single snapshot
     if (m_single && !m_single->check(snapshot_modifies_project(snapshot_type) && (snapshot_name.empty() || snapshot_name.back() != '!')))
         return;
@@ -16976,6 +18949,11 @@ void Plater::priv::undo()
     while (--it_current != snapshots.begin() && !snapshot_modifies_project(*it_current));
     if (it_current == snapshots.begin())
         return;
+    // Assembly stack: route to the slim, isolated assembly path.
+    if (m_undo_redo_stack_active == &m_undo_redo_stack_assemble) {
+        this->assemble_undo_redo_to(it_current);
+        return;
+    }
     if (get_current_canvas3D()->get_canvas_type() == GLCanvas3D::CanvasAssembleView) {
         if (it_current->snapshot_data.snapshot_type != UndoRedo::SnapshotType::GizmoAction &&
             it_current->snapshot_data.snapshot_type != UndoRedo::SnapshotType::EnteringGizmo &&
@@ -16994,6 +18972,11 @@ void Plater::priv::redo()
     while (it_current != snapshots.end() && !snapshot_modifies_project(*it_current++));
     if (it_current != snapshots.end()) {
         while (it_current != snapshots.end() && !snapshot_modifies_project(*it_current++));
+        // Assembly stack: route to the slim, isolated assembly path.
+        if (m_undo_redo_stack_active == &m_undo_redo_stack_assemble) {
+            this->assemble_undo_redo_to(--it_current);
+            return;
+        }
         this->undo_redo_to(--it_current);
     }
 }
@@ -17012,12 +18995,25 @@ bool Plater::priv::up_to_date(bool saved, bool backup)
     size_t& last_time = backup ? m_backup_timestamp : m_saved_timestamp;
     if (saved) {
         last_time = undo_redo_stack_main().active_snapshot_time();
-        if (!backup)
+        if (!backup) {
             undo_redo_stack_main().mark_current_as_saved();
+            // Assembly-only edits are tracked separately from the main undo stack. A successful
+            // project save (or "don't save" continue) clears that tip so the next close prompt
+            // does not keep asking for already-handled assembly changes.
+            m_assemble_project_dirty = false;
+            if (!m_undo_redo_stack_assemble.empty())
+                m_undo_redo_stack_assemble.mark_current_as_saved();
+        }
         return true;
     }
     else {
-        return !undo_redo_stack_main().has_real_change_from(last_time);
+        if (undo_redo_stack_main().has_real_change_from(last_time))
+            return false;
+        // Independent assembly stack may hold unsaved guide / pose edits while the prepare
+        // stack stays clean — still treat the project as dirty for close / new-project.
+        if (m_assemble_project_dirty)
+            return false;
+        return true;
     }
 }
 
@@ -17479,6 +19475,8 @@ void Plater::render_project_state_debug_window() const { p->render_project_state
 Sidebar&        Plater::sidebar()           { return *p->sidebar; }
 const Model&    Plater::model() const       { return p->model; }
 Model&          Plater::model()             { return p->model; }
+const Model&    Plater::assemble_model() const { return p->m_assemble_model; }
+Model&          Plater::assemble_model()       { return p->m_assemble_model; }
 Bed3D &         Plater::bed() { return p->bed; }
 BackgroundSlicingProcess &Plater::background_process() { return p->background_process; }
 const Print&    Plater::fff_print() const   { return p->fff_print; }
@@ -17727,6 +19725,12 @@ int Plater::load_project(wxString const &filename2,
     int wx_dlg_id = close_with_confirm(check);
     if (wx_dlg_id == wxID_CANCEL) {
         return wx_dlg_id;
+    }
+
+    // Same as new_project: stop playback / clear assembly runtime before the
+    // incoming 3mf replaces the model, otherwise play-mode chrome can linger.
+    if (auto *assemble_canvas = get_assmeble_canvas3D()) {
+        assemble_canvas->new_project_clear_assembly_steps_tree_view(true);
     }
 
     //BBS: add only gcode mode
@@ -18255,8 +20259,11 @@ bool Plater::up_to_date(bool saved, bool backup)
         Slic3r::clear_other_changes(backup);
         return p->up_to_date(saved, backup);
     }
-    return p->model.objects.empty() || (p->up_to_date(saved, backup) &&
-                                        !Slic3r::has_other_changes(backup));
+    // Assembly dirty is already consulted inside priv::up_to_date (return false when
+    // m_assemble_project_dirty). Do NOT OR !m_assemble_project_dirty here: that short-circuits
+    // to true whenever the assembly side is clean and would swallow prepare-only unsaved edits.
+    return p->model.objects.empty()
+         || (p->up_to_date(saved, backup) && !Slic3r::has_other_changes(backup));
 }
 
 void Plater::add_model(bool imperial_units, std::string fname)
@@ -18473,9 +20480,8 @@ void Plater::_calib_pa_tower(const Calib_Params &params)
     //print_config->set_key_value("inner_wall_jerk", new ConfigOptionFloat(1.0f));
     auto full_config = wxGetApp().preset_bundle->full_config();
 
-
-    update_speed_parameter("outer_wall_speed");
-    update_speed_parameter("inner_wall_speed");
+    // Keep the process preset wall speeds untouched. The actual print speed is
+    // still clamped by the filament max volumetric speed during slicing.
     const auto _wall_generator = print_config->option<ConfigOptionEnum<PerimeterGeneratorType>>("wall_generator");
     if (_wall_generator->value == PerimeterGeneratorType::Arachne) print_config->set_key_value("wall_transition_angle", new ConfigOptionFloat(25));
     model().objects[0]->config.set_key_value("seam_position", new ConfigOptionEnum<SeamPosition>(spRear));
@@ -21129,6 +23135,17 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
 
     if (!path.Lower().EndsWith(".3mf"))
         return -1;
+
+    // Serializing the project config can throw (e.g. a non-nullable float option holding a NaN,
+    // which throws Slic3r::ConfigurationError "Serializing NaN" deep inside store_bbs_3mf). Such a
+    // ConfigurationError is a CriticalException and must never reach the wx main loop: if it does,
+    // wx tears down the app and null-derefs wxTheApp during shutdown -> hard crash. Contain it here:
+    // fail the save, tell the user which setting is bad, and let them fix it and try again.
+    try {
+    // Persist assembly-view edits: the assembly steps / tree are authored on the independent assembly
+    // model, so mirror them onto the prepare model before serialization. This covers saving while still
+    // inside the assembly view (the leave_assemble_stack sync only fires when switching panels).
+    p->sync_assemble_steps_to_main_model();
     // take care about private data stored into .3mf
     // modify model
     publish(p->model, strategy);
@@ -21352,6 +23369,19 @@ int Plater::export_3mf(const boost::filesystem::path& output_path, SaveStrategy 
     picking_thumbnails.clear();
 
     return ret;
+    } catch (const std::exception &ex) {
+        // A config option could not be serialized (or another error escaped the store). Do NOT let
+        // it propagate to the wx main loop. Log the crime scene (opt_serialize already logged the
+        // exact option key + values), fail the save, and prompt the user for interactive saves.
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": save failed with exception: " << ex.what();
+        if (!(strategy & SaveStrategy::Silence)) {
+            wxString msg = _L("Failed to save the project: an invalid setting value was found while writing the file.") + "\n\n"
+                         + from_u8(ex.what()) + "\n\n"
+                         + _L("Please check your settings and try again.");
+            GUI::show_error(this, msg);
+        }
+        return -1;
+    }
 }
 
 void Plater::publish_project()
@@ -22466,6 +24496,7 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
         }
         //BBS: add bed_exclude_area
         else if (opt_key == "printable_area" || opt_key == "bed_exclude_area"
+            || opt_key == "bed_heat_soak_area"
             || opt_key == "extruder_clearance_height_to_lid"
             || opt_key == "extruder_clearance_height_to_rod") {
             bed_shape_changed = true;
@@ -22627,6 +24658,51 @@ void Plater::set_bed_shape() const
 void Plater::set_bed_shape(const Pointfs& shape, const Pointfs& exclude_area, const Pointfs& wrapping_exclude_area, const double printable_height, std::vector<Pointfs> extruder_areas, std::vector<double> extruder_heights, const std::string& custom_texture, const std::string& custom_model, bool force_as_custom) const
 {
     p->set_bed_shape(shape, exclude_area, wrapping_exclude_area, printable_height, extruder_areas, extruder_heights, custom_texture, custom_model, force_as_custom);
+}
+
+void Plater::on_plate_layout_changed()
+{
+    update_bed_heat_soak_notification();
+    if (GLCanvas3D *canvas = p->get_current_canvas3D())
+        canvas->schedule_extra_frame(0);
+}
+
+void Plater::on_show_bed_heat_soak_area_changed()
+{
+    update_bed_heat_soak_notification();
+}
+
+void Plater::update_bed_heat_soak_notification()
+{
+    GLCanvas3D *canvas = p->get_current_canvas3D();
+    if (!canvas || (canvas->get_canvas_type() != GLCanvas3D::CanvasView3D &&
+                    canvas->get_canvas_type() != GLCanvas3D::CanvasPreview))
+        return;
+
+    NotificationManager *notify = get_notification_manager();
+    if (!notify)
+        return;
+
+    const bool enabled = wxGetApp().app_config->get("show_bed_heat_soak_area") != "false";
+    const bool show = enabled && p->partplate_list.get_cur_plate_soak_level() > 0;
+    if (show == p->partplate_list.is_heat_soak_visible())
+        return;
+
+    if (show)
+    {
+        notify->push_bed_heat_soak_notification(
+            _u8L("When thermal preconditioning is enabled, duration auto-adjusts to the model's "
+                 "position for optimal first-layer quality; the farther from the center, the longer "
+                 "it takes. White boxes mark the boundary lines. To disable the guidelines and this "
+                 "warning, go to Preferences > 3D."));
+    }
+    else
+    {
+        notify->close_bed_heat_soak_notification();
+    }
+
+    p->partplate_list.set_heat_soak_visible(show);
+    canvas->schedule_extra_frame(0);
 }
 
 void Plater::force_filament_colors_update()
@@ -23234,7 +25310,23 @@ void Plater::show_seqprintinfo_notification(bool has_error)
     }
 }
 void Plater::mirror(Axis axis)      { p->mirror(axis); }
-void Plater::split_object()         { p->split_object(); }
+void Plater::split_object(ModelObject *mo, bool ignore_warning) { p->split_object(mo, ignore_warning); }
+void Plater::set_suppress_assemble_delete_propagation(bool suppress) { p->set_suppress_assemble_delete_propagation(suppress); }
+void Plater::ensure_model_object_volume_assemble_initialized(ModelObject *object)
+{
+    if (object == nullptr)
+        return;
+    for (ModelVolume *mv : object->volumes) {
+        if (mv == nullptr || !mv->is_model_part())
+            continue;
+        mv->ensure_part_guid();
+        if (!mv->is_assemble_initialized())
+            mv->set_assemble_transformation(mv->get_transformation());
+    }
+}
+void Plater::propagate_volume_delete_to_assemble(const ModelVolume &prepare_volume) { p->propagate_volume_delete_to_assemble(prepare_volume); }
+void Plater::sync_assemble_volume_name(const std::string &part_guid, const std::string &new_name) { p->sync_assemble_volume_name(part_guid, new_name); }
+void Plater::change_extruder_for_assemble_selection(int extruder) { p->change_extruder_for_assemble_selection(extruder); }
 void Plater::split_volume()         { p->split_volume(); }
 void Plater::optimize_rotation()    { if (!p->m_ui_jobs.is_any_running()) p->m_ui_jobs.optimize_rotation(); }
 void Plater::update_menus()         { p->menus.update(); }
@@ -23314,9 +25406,11 @@ bool Plater::is_printer_configed_by_BBL() {
 
 void Plater::fill_color(int extruder_id)
 {
-    if (can_fillcolor()) {
-        p->assemble_view->get_canvas3d()->get_selection().fill_color(extruder_id);
-    }
+    // The paint toolbar (EVT_GLTOOLBAR_FILLCOLOR) is bound only on the assembly canvas, so this always
+    // targets the assembly view. Edit the independent assembly model directly (the old path routed the
+    // assembly selection through the prepare-side ObjectList, which no longer matches m_assemble_model).
+    if (can_fillcolor())
+        change_extruder_for_assemble_selection(extruder_id);
 }
 
 //BBS
@@ -23518,6 +25612,11 @@ void Plater::mark_assemble_view_requires_zoom_to_volumes()
             p_camera->requires_zoom_to_volumes = true;
         }
     }
+}
+
+bool Plater::is_assemble_undo_stack_active() const
+{
+    return p->m_undo_redo_stack_active == &p->m_undo_redo_stack_assemble;
 }
 
 const Camera& Plater::get_picking_camera() const
@@ -23963,7 +26062,6 @@ void Plater::open_filament_map_setting_dialog(wxCommandEvent &evt)
     );
 
     FilamentMapDialog filament_dlg(this,
-        filament_colors,
         filament_types,
         plate_filament_maps,
         plate_filament_volume_maps,
@@ -25039,6 +27137,8 @@ wxMenu* Plater::default_menu()          { return p->menus.default_menu();       
 wxMenu* Plater::instance_menu()         { return p->menus.instance_menu();          }
 wxMenu* Plater::layer_menu()            { return p->menus.layer_menu();             }
 wxMenu* Plater::multi_selection_menu()  { return p->menus.multi_selection_menu();   }
+wxMenu *Plater::assemble_object_menu() { return p->menus.assemble_object_menu(); }
+wxMenu *Plater::assemble_part_menu() { return p->menus.assemble_part_menu(); }
 wxMenu *Plater::assemble_multi_selection_menu() { return p->menus.assemble_multi_selection_menu(); }
 wxMenu *Plater::filament_action_menu(int active_filament_menu_id) { return p->menus.filament_action_menu(active_filament_menu_id); }
 int     Plater::GetPlateIndexByRightMenuInLeftUI() { return p->m_is_RightClickInLeftUI; }
