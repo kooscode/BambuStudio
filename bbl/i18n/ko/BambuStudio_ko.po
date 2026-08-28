@@ -2,7 +2,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: Bambu Studio\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-06-15 21:22+0800\n"
+"POT-Creation-Date: 2026-06-25 17:06+0800\n"
 "PO-Revision-Date: \n"
 "Last-Translator: \n"
 "Language-Team: \n"
@@ -1085,7 +1085,7 @@ msgstr "커넥터가 절단 윤곽에서 벗어남"
 msgid "connector is out of object"
 msgstr "커넥터가 객체에서 벗어남"
 
-msgid "connectors is out of object"
+msgid "connectors are out of object"
 msgstr "커넥터는 객체 표면에 있어야 합니다."
 
 msgid "Some connectors are overlapped"
@@ -1273,13 +1273,13 @@ msgstr ""
 "기능 1이 초기화되었습니다,\n"
 "기능 2가 기능 1이 되었습니다"
 
-msgid "Warning:please select Plane's feature."
+msgid "Warning: Please select a Plane feature."
 msgstr "경고: 비행기 기능을 선택하세요."
 
-msgid "Warning:please select Point's or Circle's feature."
+msgid "Warning: Please select a Point or Circle feature."
 msgstr "경고: 포인트 또는 서클의 기능을 선택하세요."
 
-msgid "Warning:please select two different mesh."
+msgid "Warning: Please select two different meshes."
 msgstr "경고: 서로 다른 두 개의 메시를 선택하세요."
 
 msgid "Copy to clipboard"
@@ -1323,6 +1323,9 @@ msgstr "면 2 기준 뒤집기"
 
 msgid "Assemble"
 msgstr "결합"
+
+msgid "Please exit the assembly guide before using this tool."
+msgstr ""
 
 msgid "Please confirm explosion ratio = 1 and select at least two volumes."
 msgstr "폭발 비율 = 1을 확인하고 최소 두 권을 선택하세요."
@@ -1528,31 +1531,31 @@ msgstr "포함 깊이"
 msgid "Text Gap"
 msgstr "글자 간격"
 
-msgid "Warning:There is a mirror in the text matrix, and dragging it will completely regenerate it."
+msgid "Warning: There is a mirror in the text matrix, and dragging it will completely regenerate it."
 msgstr "경고: 텍스트 매트릭스에 대칭이 있으며 드래그하면 완전히 재생성됩니다."
 
-msgid "Warning:Due to font upgrades,previous font may not necessarily be replaced successfully, and recommend you to modify the font."
+msgid "Warning: Due to font upgrades, previous font may not necessarily be replaced successfully. Please modify the font."
 msgstr "경고: 글꼴 업그레이드로 인해 이전 글꼴이 성공적으로 대체되지 않을 수 있으니 글꼴을 수정하는 것이 좋습니다."
 
-msgid "Warning:create text fail."
+msgid "Warning: Text creation failed."
 msgstr "경고: 텍스트 작성에 실패했습니다."
 
-msgid "Warning:text normal is error."
+msgid "Warning: Text normal has an error."
 msgstr "경고: 일반 텍스트 오류입니다."
 
-msgid "Warning:text normal has been reset."
+msgid "Warning: Text normal has been reset."
 msgstr "경고: 텍스트 일반이 재설정되었습니다."
 
-msgid "Warning:current text spacing is not very reasonable. If you continue editing, a more reasonable text spacing will be generated."
+msgid "Warning: Current text spacing is not optimal. If you continue editing, a more reasonable text spacing will be generated."
 msgstr "경고: 현재 텍스트 간격이 적절하지 않습니다. 편집을 계속하면 더 합리적인 텍스트 간격이 생성됩니다."
 
-msgid "Warning:old matrix has at least two parameters: mirroring, scaling, and rotation. If you continue editing, it may not be correct. Please dragging text or cancel using current pose, save and reedit again."
-msgstr "경고: 이전 매트릭스에는 미러링, 크기 조정 및 회전이라는 두 가지 이상의 매개변수가 있습니다. 계속 편집하면 올바르지 않을 수 있습니다. 텍스트를 드래그하거나 현재 포즈를 사용하여 취소하고 저장한 후 다시 편집하세요."
+msgid "Warning: Old matrix has at least two parameters: mirroring, scaling, and rotation. If you continue editing, it may not be correct. Please drag the text or cancel the current pose, save and reedit again."
+msgstr ""
 
-msgid "Error:Detecting an incorrect mesh id or an unknown error, regenerating text may result in incorrect outcomes.Please drag text,save it then reedit it again."
+msgid "Error: Detecting an incorrect mesh id or an unknown error, regenerating text may result in incorrect outcomes. Please drag text, save it then reedit it again."
 msgstr "오류: 잘못된 메시 ID 또는 알 수 없는 오류를 감지하여 텍스트를 다시 생성하면 잘못된 결과가 발생할 수 있으므로 텍스트를 드래그하여 저장한 후 다시 편집하세요."
 
-msgid "Warning:Due to functional upgrade, rotation information cannot be restored. Please drag or modify text,save it and reedit it will ok."
+msgid "Warning: Due to functional upgrade, rotation information cannot be restored. Please drag or modify text, save it and reedit it to fix the issue."
 msgstr "경고: 기능 업그레이드로 인해 회전 정보를 복원할 수 없습니다. 텍스트를 드래그하거나 수정한 후 저장하고 다시 편집하면 정상적으로 복구됩니다."
 
 msgid "Detected that text did not adhere to mesh surface. Please manually drag yellow square to mesh surface that needs to be adhered."
@@ -1770,7 +1773,7 @@ msgstr "엠보싱 모양의 누락된 SVG 파일"
 msgid "Missing data of svg file"
 msgstr "누락된 SVG 파일 데이터"
 
-msgid "Tip:If you want to place svg file on another part surface,you should select part first, and then drag svg file to the part surface."
+msgid "Tip: If you want to place an SVG file on another part surface, select the part first, then drag the SVG file to the part surface."
 msgstr "팁: 다른 파트 서페이스에 SVG 파일을 배치하려면 먼저 파트를 선택한 다음 SVG 파일을 파트 서페이스로 드래그해야 합니다."
 
 #. TRN - Preview of filename after clear local filepath.
@@ -3122,6 +3125,420 @@ msgstr "최대 온도는 다음을 초과할 수 없습니다"
 msgid "The minmum temperature should not be less than "
 msgstr "최소 온도는 다음보다 낮지 않아야합니다"
 
+msgid "Export file Settings"
+msgstr ""
+
+msgid "Homepage  title"
+msgstr ""
+
+msgid "For privacy reasons, image paths are not saved or restored.Just for pdf/md file."
+msgstr ""
+
+msgid "Homepage image"
+msgstr ""
+
+msgid "Second page image"
+msgstr ""
+
+msgid "Browse"
+msgstr "브라우저"
+
+msgid "Image files"
+msgstr ""
+
+msgid "All files"
+msgstr ""
+
+msgid "Open image file"
+msgstr ""
+
+msgid "Step"
+msgstr "단계"
+
+msgid "Install parts"
+msgstr ""
+
+msgid "Apply the final assembly pose to the objects or parts added in the current step?"
+msgstr ""
+
+msgid "Apply final assembly pose"
+msgstr ""
+
+msgid "Assembly Guide"
+msgstr "조립 가이드"
+
+msgid "PDF files"
+msgstr ""
+
+msgid "Markdown files"
+msgstr ""
+
+msgid "MP4 files"
+msgstr ""
+
+msgid "Export Assembly Guide to PDF"
+msgstr ""
+
+msgid "Export Assembly Guide to Markdown"
+msgstr ""
+
+msgid "Export Assembly Guide to MP4"
+msgstr ""
+
+msgid "Exporting file"
+msgstr ""
+
+msgid "Export"
+msgstr "내보내기"
+
+msgid "Saving project will automatically switch to end frame"
+msgstr ""
+
+msgid "New Step"
+msgstr ""
+
+msgid "Final assembly"
+msgstr ""
+
+msgid "end frame"
+msgstr ""
+
+msgid "Assembly Structure"
+msgstr ""
+
+msgid "Start your assembly journey from Add Step"
+msgstr ""
+
+msgctxt "AssemblyStructure"
+msgid "Default"
+msgstr "기본값"
+
+msgid "Contain"
+msgstr ""
+
+msgid "Assembly Module"
+msgstr ""
+
+msgid "Click to add objects to the current step"
+msgstr ""
+
+msgid "_copy"
+msgstr ""
+
+msgid "Are you sure you want to delete the current step?"
+msgstr ""
+
+msgid "Delete step"
+msgstr ""
+
+msgid "Model"
+msgstr "모델"
+
+msgid "Volume"
+msgstr ""
+
+msgid "start frame"
+msgstr ""
+
+msgid "transition frame"
+msgstr ""
+
+#, boost-format
+msgid "Plate %1%"
+msgstr ""
+
+msgid "Assembly Step"
+msgstr ""
+
+msgid "Start frame"
+msgstr ""
+
+msgid "End frame"
+msgstr ""
+
+msgid "Transition frame"
+msgstr ""
+
+msgid "Frame"
+msgstr ""
+
+msgid "step"
+msgstr ""
+
+msgid "Play all frames for all steps."
+msgstr ""
+
+msgid "Toggle playback speed."
+msgstr ""
+
+msgid "Play previous frame."
+msgstr ""
+
+msgid "Play next frame."
+msgstr ""
+
+msgid "Set export file parameters"
+msgstr ""
+
+msgid "Camera margin factor for the current frame. The larger the value, the more margin."
+msgstr ""
+
+msgid "Modify camera margin"
+msgstr ""
+
+msgid "Edit step name"
+msgstr ""
+
+msgid "Insert step before"
+msgstr ""
+
+msgid "Insert step after"
+msgstr ""
+
+msgid "Tip"
+msgstr "도움말"
+
+msgid "No step card is currently selected. Pose-changing operations such as move gizmo will affect the actual final-assembly view."
+msgstr ""
+
+msgid "Expand"
+msgstr ""
+
+msgid "Collapse"
+msgstr "접기"
+
+msgid "Options"
+msgstr "옵션"
+
+msgid "Go to Wiki"
+msgstr "Wiki로 가기"
+
+msgid "Copy current step"
+msgstr ""
+
+msgid "Delete current step"
+msgstr ""
+
+msgid "Add some objects to current step"
+msgstr ""
+
+msgid "Copy Step"
+msgstr ""
+
+msgid "Add Step"
+msgstr ""
+
+#, boost-format
+msgid "No more than %1% steps are allowed."
+msgstr ""
+
+msgid "Only copy steps. This is independent of the selected objects on the canvas."
+msgstr ""
+
+msgid "Only add empty steps. This has nothing to do with the selected objects on the canvas."
+msgstr ""
+
+msgid "Exit"
+msgstr ""
+
+msgid "Click to add Cyber Brick"
+msgstr ""
+
+msgid "Delete this keyframe"
+msgstr ""
+
+msgid "Export PDF"
+msgstr ""
+
+msgid "Export Markdown"
+msgstr ""
+
+msgid "Export MP4"
+msgstr ""
+
+msgid "After exporting the Markdown document, you can edit it in third-party software such as Zettlr and then export it to PDF."
+msgstr ""
+
+msgid "Auto recommend"
+msgstr ""
+
+msgid "Model objects only"
+msgstr ""
+
+msgid "Model parts only"
+msgstr ""
+
+msgid "Automatically choose object-or-part-level labels: objects already shown in earlier steps are collapsed into a single object label, while the rest are labeled per individual part."
+msgstr ""
+
+msgid "Show one label per model object."
+msgstr ""
+
+msgid "Show one label per model part."
+msgstr ""
+
+msgid "Label"
+msgstr ""
+
+msgid "Label settings"
+msgstr ""
+
+msgid "Show Object/Part labels"
+msgstr ""
+
+msgid "Show object and part names  on models"
+msgstr ""
+
+msgid "Automatically select the optimal camera perspective and auto-arrange auto recommend labels each time the checkbox is re-ticked."
+msgstr ""
+
+msgid "Auto layout"
+msgstr ""
+
+msgid "Auto-arrange labels in current view"
+msgstr ""
+
+msgid "Current view labels"
+msgstr ""
+
+msgid "Label Settings"
+msgstr ""
+
+msgid "Font size"
+msgstr ""
+
+msgid "Display mode"
+msgstr ""
+
+msgid "Export assembly guide PDF, Markdown or MP4"
+msgstr ""
+
+msgid "Screw"
+msgstr ""
+
+msgid "Note"
+msgstr "메모"
+
+msgid "Pose changes (e.g. move gizmo) made on the final-assembly step's keyframe will affect the actual assembly display."
+msgstr ""
+
+msgid "Pose changes (e.g. move gizmo) made on this step's keyframe do not affect the actual assembly display."
+msgstr ""
+
+msgid "If necessary, a relatively good position can be restored by pressing the \"apply actual assembly pose\" button at present."
+msgstr ""
+
+msgid "undoing these edits is not yet supported and will be added in a later version."
+msgstr ""
+
+msgid "Some objects were used in an earlier keyframe of the current step and are not exploded here. You can explode them manually with the move tool."
+msgstr ""
+
+msgid "Connection Type"
+msgstr ""
+
+msgid "Clip"
+msgstr ""
+
+msgid "Glue"
+msgstr ""
+
+msgid "Add Clip"
+msgstr ""
+
+msgid "Add Glue"
+msgstr ""
+
+msgid "Add Screw"
+msgstr ""
+
+msgid "Add Notes"
+msgstr ""
+
+msgid "Add Rectangle"
+msgstr ""
+
+msgid "Add Circle"
+msgstr ""
+
+msgid "Add Arrow"
+msgstr ""
+
+msgid "Add Text"
+msgstr ""
+
+msgid "Text"
+msgstr "텍스트"
+
+msgid "Background"
+msgstr ""
+
+msgid "Timeline"
+msgstr ""
+
+msgid "Play all frames for current step"
+msgstr ""
+
+msgid "At least two keyframes are required to play."
+msgstr ""
+
+msgid "Automatically explode all objects."
+msgstr ""
+
+msgid "Automatically explode all parts."
+msgstr ""
+
+msgid "Apply the final assembly pose to the currently selected object or part(if none is selected, apply it to all objects added in the current frame)"
+msgstr ""
+
+msgid "Apply current camera angle to all frames of the current step"
+msgstr ""
+
+msgid "Add keyframe"
+msgstr ""
+
+msgid "Click to select this frame"
+msgstr ""
+
+msgid "Save update"
+msgstr ""
+
+msgid "Save current frame"
+msgstr ""
+
+msgid "Assembly tree"
+msgstr ""
+
+msgid "Search"
+msgstr "검색 "
+
+msgid "List"
+msgstr ""
+
+msgid "Select all parts in a step"
+msgstr ""
+
+msgid "Red"
+msgstr ""
+
+msgid "Orange"
+msgstr ""
+
+msgid "Green"
+msgstr ""
+
+msgid "Blue"
+msgstr ""
+
+msgid "Black"
+msgstr ""
+
+msgid "Grey"
+msgstr ""
+
+msgid "White"
+msgstr ""
+
 msgid ""
 "All the selected objects are on the locked plate,\n"
 "We can not do auto-arrange on these objects."
@@ -3212,9 +3629,6 @@ msgstr "텍스트 투영에 유효한 표면이 없습니다."
 
 msgid "Text mesh ie empty."
 msgstr "텍스트 메시가 비어 있습니다."
-
-msgid "Text"
-msgstr "텍스트"
 
 msgid "Error! Unable to create thread!"
 msgstr "오류! 스레드를 생성할 수 없습니다!"
@@ -3642,9 +4056,6 @@ msgstr "%s는 %s를 지원하지 않습니다."
 msgid "Dynamic flow Calibration"
 msgstr "동적 압출량 캘리브레이션"
 
-msgid "Step"
-msgstr "단계"
-
 msgid "Unmapped"
 msgstr "매핑되지 않음"
 
@@ -3829,7 +4240,7 @@ msgstr "새 필라멘트를 삽입할 때 AMS가 자동으로 정보를 읽지 �
 msgid "Power on update"
 msgstr "시작 시 업데이트"
 
-msgid "The AMS will automatically read the information of inserted filament on start-up. It will take about 1 minute.The reading process will roll filament spools."
+msgid "The AMS will automatically read the information of inserted filament on start-up. It will take about 1 minute. The reading process will roll filament spools."
 msgstr "AMS는 시작 시 삽입된 필라멘트의 정보를 자동으로 읽습니다. 약 1분이 소요됩니다. 읽는 과정에서 필라멘트 스풀이 회전합니다."
 
 msgid "The AMS will not automatically read information from inserted filament during startup and will continue to use the information recorded before the last shutdown."
@@ -3886,6 +4297,15 @@ msgstr "AMS 시퀀스 재설정"
 
 msgid "File"
 msgstr "파일"
+
+msgid "Save Project"
+msgstr "프로젝트 저장"
+
+msgid "Undo"
+msgstr "실행 취소"
+
+msgid "Redo"
+msgstr "다시 실행"
 
 msgid "Calibration"
 msgstr "캘리브레이션"
@@ -4000,9 +4420,6 @@ msgstr "제거"
 msgid "Not found:"
 msgstr "찾을 수 없음:"
 
-msgid "Model"
-msgstr "모델"
-
 msgid "Choose an STL file to import bed shape from:"
 msgstr "베드 모양을 가져올 STL 파일을 선택합니다:"
 
@@ -4071,7 +4488,7 @@ msgstr ""
 "기본값으로 재설정"
 
 #, c-format, boost-format
-msgid "Current chamber temperature is higher than the material's safe temperature,it may result in material softening and clogging.The maximum safe temperature for the material is %d"
+msgid "Current chamber temperature is higher than the material's safe temperature, it may result in material softening and clogging. The maximum safe temperature for the material is %d"
 msgstr "현재 챔버 온도가 재료의 안전 온도보다 높아 재료가 연화되고 노즐이 막힐 수 있으며, 재료의 최대 안전 온도는 %d입니다"
 
 msgid ""
@@ -4546,7 +4963,7 @@ msgstr "AMS 온도가 너무 높아 필라멘트가 연화될 수 있습니다. 
 msgid "The current chamber temperature or the target chamber temperature exceeds 45℃.In order to avoid extruder clogging,low temperature filament(PLA/PETG/TPU) is not allowed to be loaded."
 msgstr "현재 챔버 온도 또는 목표 챔버 온도가 45℃를 초과합니다. 압출기 막힘을 방지하기 위해 저온 필라멘트(PLA/PETG/TPU)는 로드할 수 없습니다."
 
-msgid "Low temperature filament(PLA/PETG/TPU) is loaded in the extruder.In order to avoid extruder clogging,it is not allowed to set the chamber temperature."
+msgid "Low temperature filament (PLA/PETG/TPU) is loaded in the extruder. In order to avoid extruder clogging, it is not allowed to set the chamber temperature."
 msgstr "압출기에 저온 필라멘트(PLA/PETG/TPU)가 적재되며, 압출기 막힘을 방지하기 위해 챔버 온도를 설정할 수 없습니다."
 
 msgid "When you set the chamber temperature below 40℃, the chamber temperature control will not be activated. And the target chamber temperature will automatically be set to 0℃."
@@ -4839,9 +5256,6 @@ msgstr "필라멘트 교체"
 
 msgid "Wipe"
 msgstr "닦기"
-
-msgid "Options"
-msgstr "옵션"
 
 msgid "travel"
 msgstr "이동"
@@ -5204,9 +5618,6 @@ msgstr "빌드 플레이트 선택"
 msgid "Change camera perspective"
 msgstr "카메라 시점 변경"
 
-msgid "Go to Wiki"
-msgstr "Wiki로 가기"
-
 #, boost-format
 msgid "Current assembly rate: %1%%%, volume rate: %2%%%"
 msgstr "현재 조립률: %1%%%, 볼륨률: %2%%%"
@@ -5243,10 +5654,7 @@ msgstr "카메라 맞춤"
 msgid "Fit camera to scene or selected object."
 msgstr "장면 또는 선택한 오브젝트에 카메라를 맞춥니다."
 
-msgid "Unlock camera"
-msgstr ""
-
-msgid "Lock camera"
+msgid "Auto recommend camera angle(Only works when the assembly step function is active)"
 msgstr ""
 
 msgid "Paint Toolbar"
@@ -5267,10 +5675,10 @@ msgstr "어셈블리 컨트롤"
 msgid "Selection Mode"
 msgstr "선택 모드"
 
-msgid "OnlyCurrentStep"
+msgid "Show Current Step Objects Only"
 msgstr ""
 
-msgid "Highlight"
+msgid "X-Ray Other Objects"
 msgstr ""
 
 msgid "Display Mode"
@@ -5661,9 +6069,6 @@ msgstr "프로젝트 파일 열기"
 msgid "Recent projects"
 msgstr "최근 프로젝트"
 
-msgid "Save Project"
-msgstr "프로젝트 저장"
-
 msgid "Save current project to file"
 msgstr "현재 프로젝트를 파일에 저장"
 
@@ -5721,9 +6126,6 @@ msgstr "프리셋 번들 내보내기"
 msgid "Export current configuration to files"
 msgstr "현재 설정을 파일로 내보내기"
 
-msgid "Export"
-msgstr "내보내기"
-
 msgid "Publish to MakerWorld"
 msgstr "MakerWorld에 게시"
 
@@ -5732,12 +6134,6 @@ msgstr "집단 사전 설정 관리"
 
 msgid "Quit"
 msgstr "종료"
-
-msgid "Undo"
-msgstr "실행 취소"
-
-msgid "Redo"
-msgstr "다시 실행"
 
 msgid "Cut selection to clipboard"
 msgstr "선택 항목을 클립보드로 잘라내기"
@@ -6050,7 +6446,7 @@ msgstr "프린터가 현재 다운로드 중입니다. 다운로드가 완료된
 msgid "Printer camera is malfunctioning."
 msgstr "프린터 카메라가 오작동합니다."
 
-msgid "Problem occured. Please update the printer firmware and try again."
+msgid "Problem occurred. Please update the printer firmware and try again."
 msgstr "문제가 발생했습니다. 프린터 펌웨어를 업데이트하고 다시 시도하세요."
 
 msgid "LAN Only Liveview is off. Please turn on the liveview on printer screen."
@@ -6330,9 +6726,6 @@ msgstr "Y/Z 축 교환"
 
 msgid "(LAN)"
 msgstr "(LAN)"
-
-msgid "Search"
-msgstr "검색 "
 
 msgid "My Device"
 msgstr "내 장치"
@@ -6800,9 +7193,6 @@ msgstr "%s 경고"
 msgid "%s has a warning"
 msgstr "%s에 경고가 있습니다."
 
-msgid "Collapse"
-msgstr "접기"
-
 msgid "View details"
 msgstr "상세 보기"
 
@@ -6960,9 +7350,6 @@ msgstr "위치로 가기"
 
 msgid "Error:"
 msgstr "오류:"
-
-msgid "Enable support for"
-msgstr "다음에 대한 지원 활성화"
 
 msgid "Open link for more info"
 msgstr "자세한 정보는 링크를 열어주세요"
@@ -7627,7 +8014,7 @@ msgstr "텍스처 가져오기 경고"
 
 msgid ""
 "The imported STEP file is split by sub-assembly, so some objects may not be placed on the build plate at first.\n"
-"It is expected if they are placed on the build plate later after translation or similar operations.\n"
+"It is expected if they are placed on the build plate later after move,rotate gizmo or similar operations.\n"
 "The overall assembly can be checked from the assembly thumbnail or by entering the assembly view."
 msgstr ""
 
@@ -8397,9 +8784,6 @@ msgstr ""
 "\n"
 "이 기능을 계속 사용하시겠습니까?"
 
-msgid "Browse"
-msgstr "브라우저"
-
 msgid "Choose Download Directory"
 msgstr "다운로드 디렉터리 선택"
 
@@ -8535,7 +8919,7 @@ msgstr "2D 창 중앙이 아닌 3D 보기에서 마우스 포인터의 위치를
 msgid "Always show shells in preview"
 msgstr "항상 셸을 미리 보기로 표시"
 
-msgid "Always show shells or not in preview view tab.If change value,you should reslice."
+msgid "Always show shells or not in preview view tab. If you change this value, you should reslice."
 msgstr "미리보기 탭에서 항상 셸을 표시하거나 표시하지 않으며 값을 변경하면 다시 릴리스해야 합니다."
 
 msgid "Import a single SVG and split it"
@@ -9160,7 +9544,7 @@ msgstr "필라멘트가 AMS 슬롯의 필라멘트와 일치하지 않습니다.
 msgid "The selected printer (%s) is incompatible with the print file configuration (%s). Please adjust the printer preset in the prepare page or choose a compatible printer on this page."
 msgstr "선택한 프린터(%s)가 출력 파일 구성(%s)과 호환되지 않습니다. 준비 페이지에서 프린터 사전 설정을 조정하거나 이 페이지에서 호환되는 프린터를 선택하세요."
 
-msgid "When enable spiral vase mode, machines with I3 structure will not generate timelapse videos."
+msgid "When enabling spiral vase mode, machines with I3 structure will not generate timelapse videos."
 msgstr "나선형 꽃병 모드가 활성화되면 I3 구조의 머신은 타임랩스 동영상을 생성하지 않습니다."
 
 msgid "The current printer does not support timelapse in Traditional Mode when printing By-Object."
@@ -9189,8 +9573,14 @@ msgstr "다음을 확인하십시오."
 msgid "Please fix the error above, otherwise printing cannot continue."
 msgstr "위의 오류를 수정하지 않으면 출력을 계속할 수 없습니다."
 
-msgid "Please click the confirm button if you still want to proceed with printing."
-msgstr "출력을 계속 진행하려면 확인 버튼을 클릭하십시오."
+msgid "Please click the \"Continue printing\"  button if you still want to proceed with printing."
+msgstr ""
+
+msgid "Continue printing"
+msgstr ""
+
+msgid "Return to modify"
+msgstr ""
 
 msgid "This checks the flatness of heatbed. Leveling makes extruded height uniform."
 msgstr "히트 베드의 평탄도를 확인합니다. 수평을 맞추면 압출 높이가 균일해집니다."
@@ -9584,7 +9974,7 @@ msgstr "읽고 수락"
 msgid "Terms and Conditions"
 msgstr "이용약관"
 
-msgid "Thank you for purchasing a Bambu Lab device.Before using your Bambu Lab device, please read the termsand conditions.By clicking to agree to use your Bambu Lab device, you agree to abide by the Privacy Policy and Terms of Use(collectively, the \"Terms\"). If you do not comply with or agree to the Bambu Lab Privacy Policy, please do not use Bambu Lab equipment and services."
+msgid "Thank you for purchasing a Bambu Lab device. Before using your Bambu Lab device, please read the terms and conditions. By clicking to agree to use your Bambu Lab device, you agree to abide by the Privacy Policy and Terms of Use (collectively, the \"Terms\"). If you do not comply with or agree to the Bambu Lab Privacy Policy, please do not use Bambu Lab equipment and services."
 msgstr "Bambu Lab 기기를 구매해 주셔서 감사합니다. Bambu Lab 기기를 사용하기 전에 이용약관을 읽어주시기 바랍니다. Bambu Lab 기기 사용에 동의하기 위해 클릭하면 개인정보 보호정책 및 이용약관(이하 통칭하여 \"약관\")을 준수하는 데 동의하는 것입니다. Bambu Lab 개인정보 처리방침을 준수하지 않거나 동의하지 않는 경우, Bambu Lab 기기 및 서비스를 사용하지 마십시오."
 
 msgid "and"
@@ -10098,7 +10488,7 @@ msgstr "펌웨어 리트랙션"
 msgid "Detached"
 msgstr "분리됨"
 
-msgid "The current preset is a project preset and can't be used to create a new preset. Please select a system preset or user preset, then try again."
+msgid "The current preset is embedded in the 3MF project file. Please save changes directly.  'Save as new' is not supported for preset inside project."
 msgstr ""
 
 msgid "Unable to save preset"
@@ -10317,9 +10707,6 @@ msgstr "사진"
 msgid "Bill of Materials"
 msgstr "BOM"
 
-msgid "Assembly Guide"
-msgstr "조립 가이드"
-
 msgid "Author"
 msgstr "작성자"
 
@@ -10420,9 +10807,6 @@ msgstr "텍스처 가져오기가 일시적으로 불가능하며, 부분 색칠
 msgid " And "
 msgstr " 및 "
 
-msgid "Note"
-msgstr "메모"
-
 msgid "The color has been selected, you can choose OK to continue or manually adjust it."
 msgstr "색상이 선택되었으면 계속하려면 확인을 선택하거나 수동으로 조정할 수 있습니다."
 
@@ -10503,9 +10887,6 @@ msgstr ""
 
 msgid "Use AMS"
 msgstr "AMS 사용"
-
-msgid "Tip"
-msgstr "도움말"
 
 msgid "Only synchronize filament type and color, not including AMS slot information."
 msgstr "필라멘트 유형과 색상만 동기화하며, AMS 슬롯 정보는 포함하지 않습니다."
@@ -12260,6 +12641,22 @@ msgstr "브릿지 압출량"
 msgid "Decrease this value slightly(for example 0.9) to reduce the amount of material for bridge, to improve sag"
 msgstr "이 가치를 약간 줄이면 (예: 0.9) 브릿지에서 압출되는 필라멘트의 양이 줄어들어 처짐을 방지할 수 있습니다."
 
+msgid "Bridge counterbore holes"
+msgstr ""
+
+msgid ""
+"This option creates bridges for counterbore holes, allowing them to be printed without support. Available modes include:\n"
+"1. None: No bridge is created\n"
+"2. Partially Bridged: Only a part of the unsupported area will be bridged\n"
+"3. Sacrificial Layer: A full sacrificial bridge layer is created"
+msgstr ""
+
+msgid "Partially bridged"
+msgstr ""
+
+msgid "Sacrificial layer"
+msgstr ""
+
 msgid "Top surface flow ratio"
 msgstr "상단 표면 압출량 비율"
 
@@ -12879,18 +13276,6 @@ msgstr "핫엔드 교체 시간"
 
 msgid "Time to change hotend."
 msgstr "핫엔드를 교체할 시간입니다."
-
-msgid "Cut and unload from extruder time"
-msgstr ""
-
-msgid "Time to cut filament and retract it out of the extruder, used when parallel feeding is supported. For statistics only"
-msgstr ""
-
-msgid "Extruder bite time after pre-feed"
-msgstr ""
-
-msgid "Time for the extruder to bite the filament once it has been pre-fed, used when parallel feeding is supported. For statistics only"
-msgstr ""
 
 msgid "Bed temperature type"
 msgstr "베드 온도 유형"
@@ -14829,12 +15214,6 @@ msgstr "플러시 승수(고속 모드)"
 msgid "The flush multiplier used in fast purge mode."
 msgstr "고속 퍼지 모드에서 사용되는 플러시 승수입니다."
 
-msgid "Alternate extruder printing"
-msgstr ""
-
-msgid "When the printer supports parallel (pre-)feeding, print the two extruders in an alternating order within a layer instead of finishing one extruder first. Only takes effect when the printer supports parallel feeding."
-msgstr ""
-
 msgid "Width of prime tower"
 msgstr "프라임타워의 폭입니다."
 
@@ -14997,13 +15376,6 @@ msgstr "내부채움 경로 생성"
 
 msgid "Detect overhangs for auto-lift"
 msgstr "자동 리프트를 위한 오버행 감지"
-
-msgid "Levitating objects cannot be printed without supports."
-msgstr "지지대 없이 공중에 떠 있는 객체는 출력할 수 없습니다."
-
-#, c-format, boost-format
-msgid "It seems object %s has floating regions. Please re-orient the object or enable support generation."
-msgstr "객체 %s에 허공에 떠 있는 영역이 있는 것 같습니다. 객체의 방향을 다시 조정하거나 지지대 생성을 활성화하세요."
 
 msgid "Checking support necessity"
 msgstr "서포트 필요성 확인"
@@ -17794,6 +18166,22 @@ msgid ""
 msgstr ""
 "첫 시도 성공 신뢰성\n"
 "관리 부담 감소, 예측 가능한 생산량 증가. 예: PETG 부품을 생산하는 소규모 농장은 '6시간 후 실패'와 같은 예상치 못한 문제 발생을 방지하고 생산 일정을 준수할 수 있습니다."
+
+#~ msgid "Warning:old matrix has at least two parameters: mirroring, scaling, and rotation. If you continue editing, it may not be correct. Please dragging text or cancel using current pose, save and reedit again."
+#~ msgstr "경고: 이전 매트릭스에는 미러링, 크기 조정 및 회전이라는 두 가지 이상의 매개변수가 있습니다. 계속 편집하면 올바르지 않을 수 있습니다. 텍스트를 드래그하거나 현재 포즈를 사용하여 취소하고 저장한 후 다시 편집하세요."
+
+#~ msgid "Enable support for"
+#~ msgstr "다음에 대한 지원 활성화"
+
+#~ msgid "Levitating objects cannot be printed without supports."
+#~ msgstr "지지대 없이 공중에 떠 있는 객체는 출력할 수 없습니다."
+
+#, c-format, boost-format
+#~ msgid "It seems object %s has floating regions. Please re-orient the object or enable support generation."
+#~ msgstr "객체 %s에 허공에 떠 있는 영역이 있는 것 같습니다. 객체의 방향을 다시 조정하거나 지지대 생성을 활성화하세요."
+
+#~ msgid "Please click the confirm button if you still want to proceed with printing."
+#~ msgstr "출력을 계속 진행하려면 확인 버튼을 클릭하십시오."
 
 #~ msgid "Hide"
 #~ msgstr "숨기기"

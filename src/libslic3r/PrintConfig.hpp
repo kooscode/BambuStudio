@@ -473,6 +473,7 @@ static std::string get_bed_temp_1st_layer_key(const BedType type)
 }
 
 extern const std::vector<std::string> filament_extruder_override_keys;
+extern bool is_filament_extruder_override_key(const std::string &opt_key);
 
 // for parse extruder_ams_count
 extern std::vector<std::map<int, int>> get_extruder_ams_count(const std::vector<std::string> &strs);
@@ -601,6 +602,10 @@ public:
     void                normalize_fdm();
     void                normalize_fdm_1();
     
+    // Repair nil/invalid filament_max_volumetric_speed entries carried by corrupted/legacy
+    // project files, before they propagate NaN into slicing speeds
+    void                repair_nil_filament_max_volumetric_speed();
+
     // Normalize FDM config based on print conditions (single/multi filament, print sequence, etc.)
     // Returns the list of config keys that were changed.
     // @param ori_values: Optional external storage for backup/restore of config values.
@@ -1498,6 +1503,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionFloatsNullable,     nozzle_volume))
     ((ConfigOptionPoints,             start_end_points))
     ((ConfigOptionEnum<TimelapseType>,    timelapse_type))
+    ((ConfigOptionBool,               farthest_point_timelapse))
     ((ConfigOptionFloat,              default_jerk))
     ((ConfigOptionFloat,              outer_wall_jerk))
     ((ConfigOptionFloat,              inner_wall_jerk))
